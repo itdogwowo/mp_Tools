@@ -269,11 +269,35 @@ export function guessBoardByUsb(vid, pid) {
 /**
  * 挑一個「最不容易出錯」的預設燒錄參數。
  *
- * 這支函式的每一個決策都是從真實失敗案例歸納出來的：
+ * ══ reset mode 的選擇：這裡原本是錯的 ═════════════════════════════════
+ *
+ * 原本對原生 USB 給 `no_reset`，理由是「USB-Serial-JTAG 沒有 DTR/RTS，
+ * 自動重置無效」。**那個理由錯了**，而且錯得很貴 —— 它讓連線永遠失敗。
+ *
+ * esptool-js 的 `constructResetSequence()` 實際上是這樣（讀 bundle 確認）：
+ *
+ *     if (mode === "no_reset") return [];                  // ← 完全不重置
+ *     if (mode === "usb_reset" || isUsbJtagSerialPort())
+ *         return [usbJTAGSerialReset(transport)];          // ← USB-JTAG 的正確路
+ *     else
+ *         return [classicReset(50), classicReset(550)];    // ← 橋接晶片
+ *
+ * 而 `isUsbJtagSerialPort()` 是 `getVid() === 0x303A && getPid() === 0x1001`。
+ *
+ * 所以：
+ *   · 給 `no_reset` → 回傳空陣列 → **晶片不會進 bootloader** → `Failed to connect`
+ *   · 給 `usb_reset` 或 `default_reset`，只要 VID:PID 是 303A:1001
+ *     → 走 `usbJTAGSerialReset`（它只動 RTS/DTR 的順序，硬體會據此重置）
+ *
+ * 結論：**原生 USB 要用 `usb_reset`，不是 `no_reset`。**
+ * （ESP32-S2/S3/C3/C6/H2 的 USB-Serial-JTAG 都是 303A:1001。）
+ *
+ * ══ 其他決策 ═══════════════════════════════════════════════════════════
+ *
  *   · `flashSize: 'keep'` —— 絕不擅自改動使用者的 flash 大小設定
- *   · 橋接晶片 921600 —— CP210x/CH34x 都能穩跑；原生 USB 反而要保守
+ *   · 橋接晶片 921600 —— CP210x/CH34x 都能穩跑
+ *   · 原生 USB 460800 —— 先求穩；USB-JTAG 在高 baud 下較容易出錯
  *   · ESP8266 先抹除 —— 它的 partition 配置跟其他晶片差很多
- *   · 原生 USB 不做自動重置 —— DTR/RTS 對 USB-Serial-JTAG 沒有作用
  *
  * @param {{chip: ChipFamily, mode: string}} board
  * @param {{usbSerialJtag?: boolean}} [context]
@@ -289,7 +313,93 @@ export function defaultFlashOptions(board, context = {}) {
     eraseAll: board.chip === 'esp8266',
     compress: true,
     resetAfter: board.mode !== 'uf2',
-    // esptool-js 的 reset 模式字串，不是我們自創的
-    resetMode: nativeUsb ? 'no_reset' : 'default_reset',
+    // 原生 USB 走 usb_reset（會觸發 usbJTAGSerialReset）；橋接晶片走 default_reset
+    resetMode: nativeUsb ? 'usb_reset' : 'default_reset',
   };
+}
+
+/**
+ * 這個埠是不是 USB-Serial-JTAG（原生 USB 的 ESP32-S2/S3/C3/C6/H2）。
+ *
+ * 認出來之後有兩件事會變：
+ *   1. esptool 會用 `usbJTAGSerialReset` 而不是 classic reset
+ *   2. **`resetMode` 會被忽略** —— 所以 UI 不該給使用者選，那只會誤導
+ */
+export const USB_JTAG_VID = 0x303a;
+export const USB_JTAG_PID = 0x1001;
+
+export function isUsbSerialJtag(vid, pid) {
+  return vid === USB_JTAG_VID && pid === USB_JTAG_PID;
+}
+
+/**
+ * 從 esptool 的輸出裡撈出真實的裝置資訊。
+ *
+ * ══ 為什麼要解析文字 ═══════════════════════════════════════════════════
+ *
+ * esptool-js 把晶片資訊**印到 terminal**，而不是回傳結構化物件：
+ *
+ *     Chip is ESP32-S3 (QFN56) (revision v0.2)
+ *     Features: Wi-Fi,BLE,Embedded PSRAM 8MB (AP_3v3)
+ *     Crystal is 40MHz
+ *     MAC: 58:e6:c5:72:42:24
+ *     Flash ID: 184046
+ *
+ * `ESPLoader.chip` 物件裡有些東西（`readMac()`）但要另外呼叫。
+ * 解析日誌比較省事，而且**使用者看到的跟我們填進面板的是同一份資料** ——
+ * 不會出現「log 說 A、面板說 B」這種最糟的情況。
+ *
+ * ⚠️ 這些是**啟發式**。撈不到就回 null，**不要瞎猜** ——
+ * 面板寧可留白，也不要顯示一個編出來的 MAC。
+ *
+ * @param {string} line 一行 esptool 輸出
+ * @returns {{mac?: string, chip?: string, features?: string, crystalMHz?: number, flashId?: string} | null}
+ */
+export function parseEsptoolLine(line) {
+  const text = String(line || '');
+
+  const mac = text.match(/\bMAC:\s*([0-9a-f]{2}(?::[0-9a-f]{2}){5})\b/i);
+  if (mac) return { mac: mac[1].toLowerCase() };
+
+  // `Chip is ESP32-S3 (QFN56) (revision v0.2)`
+  const chip = text.match(/^Chip is\s+(.+?)\s*$/i);
+  if (chip) return { chip: chip[1].trim() };
+
+  const features = text.match(/^Features:\s*(.+?)\s*$/i);
+  if (features) return { features: features[1].trim() };
+
+  const crystal = text.match(/^Crystal is\s*(\d+)\s*MHz/i);
+  if (crystal) return { crystalMHz: Number(crystal[1]) };
+
+  const flashId = text.match(/^Flash ID:\s*([0-9a-f]+)/i);
+  if (flashId) return { flashId: flashId[1] };
+
+  return null;
+}
+
+/** 把晶片資訊物件套用到裝置面板的狀態上。 */
+export function applyDeviceFacts(board, facts) {
+  if (!facts) return false;
+  let changed = false;
+  if (facts.mac && board.mac !== facts.mac) {
+    board.mac = facts.mac;
+    changed = true;
+  }
+  if (facts.chip && board.chip !== facts.chip) {
+    board.chip = facts.chip;
+    changed = true;
+  }
+  if (facts.features) {
+    board.features = facts.features;
+    changed = true;
+  }
+  if (facts.crystalMHz) {
+    board.crystalMHz = facts.crystalMHz;
+    changed = true;
+  }
+  if (facts.flashId) {
+    board.flashId = facts.flashId;
+    changed = true;
+  }
+  return changed;
 }

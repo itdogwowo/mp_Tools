@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mp_Tools — MicroPython 工作臺</title>
+<!-- 用 inline SVG 當 favicon：**零額外請求、零額外檔案**。
+     沒有這個的話瀏覽器會自己要求 /favicon.ico，靜態伺服器回 404，
+     console 就多一行紅字。那一行會讓真正的錯誤被忽略。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0c0e'/%3E%3Cpath d='M9 21V11h3.2l3.8 6 3.8-6H23v10h-2.6v-5.9L17.2 21h-2.4l-3.2-5.1V21z' fill='%23f0a53c'/%3E%3C/svg%3E">
 <!-- 字型已下載到本地（web/vendor/fonts/）。**刻意不連 Google Fonts CDN** ——
      這個工具要能完全離線使用，而且不該把使用者的 IP 送給第三方。 -->
 <link rel="stylesheet" href="./vendor/fonts.css">
@@ -531,11 +535,15 @@ canvas { display: block; width: 100%; }
   <!-- ═══ DEVICE STRIP ═══ -->
   <header class="strip">
     <div id="strip-slot" style="display:flex;align-items:center;gap:12px">
+      <!-- ⚠️ 這裡的內容由 `renderStrip()` 重寫。
+           不要直接寫 `$("#strip-slot").innerHTML = …` ——
+           `#conn-label` 住在這個容器裡，那樣會把它連根刪掉，
+           然後 `setConnLabel()` 就找不到元素（它會印一行容易被忽略的錯誤）。 -->
       <button class="empty-slot" id="btn-connect">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
         連線裝置
       </button>
-      <span class="label" style="color:var(--bench-400)">尚未連線任何開發板</span>
+      <span class="label" id="conn-label" style="color:var(--bench-400)">尚未連線任何開發板</span>
     </div>
     <div class="grow"></div>
     <span class="label" id="strip-activity" style="color:var(--bench-400)"></span>
@@ -616,7 +624,8 @@ import {
   explainOpenFailure, trackedPortCount,
 } from "./js/serial.js";
 import { runFlash, formatBytes, formatRate } from "./js/flasher.js";
-import { BOARDS, findBoard, guessBoardByUsb, defaultFlashOptions } from "./js/catalog.js";
+import { BOARDS, RELEASE, findBoard, guessBoardByUsb, defaultFlashOptions, isUsbSerialJtag,
+         parseEsptoolLine, applyDeviceFacts } from "./js/catalog.js";
 import { diagnoseConnectionFailure } from "./js/diagnose.js";
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -655,18 +664,90 @@ const S = {
   view: "edit",
   ptab: "repl",
   busy: null,            // { owner, label }
-  board: { name: "尚未連線", chip: "—", port: "", baud: 115200, flash: "—", fw: "—", mac: "—" },
+  /**
+   * 瀏覽器能力。**`connect()` 的第一行就讀它。**
+   *
+   * 這個欄位原本漏掉了，後果是：`connect()` 在 `S.caps.usable` 拋 TypeError，
+   * 而那是一個 async 函式裡的未處理 rejection —— **console 乾淨、畫面沒反應**。
+   * 使用者看到的是「按了連線沒動靜」。見 docs/WEB-ARCHITECTURE.md 第 11.1 節。
+   */
+  caps: capabilities(),
+  /**
+   * 裝置的事實。**每一個欄位都要初始化**，即使是空的。
+   *
+   * 這一組刻意全部預設為 falsy：`renderDeviceView` 用 `value ? 顯示 : 顯示「—」`
+   * 來判斷，所以「沒讀到」與「讀到空字串」的行為一致。
+   *
+   * 為什麼堅持要初始化：這個專案已經被「讀 undefined 的屬性 → TypeError →
+   * async 函式裡變成未處理的 rejection → console 乾淨、畫面沒反應」咬過四次。
+   * 見 docs/WEB-ARCHITECTURE.md 第 11.1 節。
+   *
+   * 這些值由 `parseEsptoolLine()` 從 esptool 的輸出撈出來填進去 ——
+   * 面板顯示的跟 log 顯示的是同一份資料。
+   */
+  board: {
+    name: "尚未連線",
+    chip: null,           // `ESP32-S3 (QFN56) (revision v0.2)`
+    mac: null,            // `58:e6:c5:72:42:24`
+    features: null,       // `Wi-Fi,BLE,Embedded PSRAM 8MB (AP_3v3)`
+    crystalMHz: null,     // 40
+    flashId: null,        // `184046`
+    usbLabel: null,       // `Espressif USB-Serial-JTAG`
+    port: null,           // `303A:1001`
+    baud: null,
+    flash: null,
+    fw: null,
+  },
   wizard: {
     step: 1, boardId: null, src: "official", progress: 0, phase: "idle", erase: false,
     // ── 真實燒錄用的欄位 ──────────────────────────────────────────
     firmwareData: null, firmwareName: "", firmwareAddress: 0, firmwareVariant: null,
     baudrate: 921600, eraseAll: false, resetMode: "default_reset",
     usbId: null, chip: null, logs: [], rate: 0, eta: null, failure: null,
+    confidence: null,
   },
 };
 
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+
+/**
+ * ══ 安靜死掉的防線 ═══════════════════════════════════════════════════════
+ *
+ * 這個專案連續踩到兩個**同類型**的 bug，而且都很難查：
+ *
+ *   1. `$("#conn-label")` → 那個 id 不存在 → TypeError
+ *   2. `S.caps` → 那個欄位沒定義 → TypeError
+ *
+ * 兩個都發生在 async 函式裡，所以**變成未處理的 promise rejection**：
+ * console 只有擴充功能的雜訊、畫面毫無反應、使用者只看到「按了沒動靜」。
+ *
+ * 下面的 check 在啟動時就把這兩類問題抓出來，而且**大聲喊**。
+ * 這比事後一個一個 debug 便宜太多。
+ */
+function checkDom(ids) {
+  const missing = ids.filter((id) => !document.getElementById(id));
+  if (missing.length) {
+    console.error(
+      `[ui] HTML 缺少這些 id：${missing.join(", ")}\n` +
+      "      程式碼若寫入它們會拋 TypeError（安靜地壞掉）。",
+    );
+  }
+  return missing;
+}
+
+function checkState(state, required) {
+  const missing = required.filter((key) => state[key] === undefined);
+  if (missing.length) {
+    console.error(
+      `[ui] 狀態物件缺少這些欄位：${missing.join(", ")}\n` +
+      "      讀取 undefined 的屬性會拋 TypeError。常見於 async 函式中 → 變成未處理的\n" +
+      "      promise rejection → console 乾淨、畫面沒反應。",
+    );
+  }
+  return missing;
+}
+
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 /* ── toast ───────────────────────────────────────────────────────────── */
@@ -690,38 +771,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /* ══════════════════════════════════════════════════════════════════════
    側欄：三種內容（裝置 / 檔案 / 說明），依目前 view 切換
    ══════════════════════════════════════════════════════════════════════ */
-const TREE = {
-  name: "/", open: true, children: [
-    { name: "boot.py", size: 142 },
-    { name: "main.py", size: 89, sel: true },
-    { name: "lib", dir: true, open: true, children: [
-      { name: "sensor.py", size: 2140 },
-      { name: "ssd1306.mpy", size: 8192, readonly: true },
-    ]},
-    { name: "webrepl_cfg.py", size: 34 },
-  ],
-};
-let uploading = null;   // { path, pct }
 
-function treeRow(node, depth, out) {
-  const pad = depth === 0 ? "" : depth === 1 ? "indent" : "indent2";
-  if (node.dir) {
-    out.push(`<div class="row ${pad}" data-dir="1"><span class="tw">${node.open ? "▾" : "▸"}</span>
-      <span class="ic" style="color:var(--solder)">▣</span><span>${esc(node.name)}</span></div>`);
-    if (node.open) node.children.forEach((c) => treeRow(c, depth + 1, out));
-  } else {
-    const uploadingHere = uploading && uploading.path.endsWith(node.name);
-    out.push(`<div class="row ${pad}" data-file="${esc(node.name)}" data-selected="${node.sel ? "true" : "false"}" title="${esc(node.name)}">
-      <span class="tw"></span>
-      <span class="ic" style="color:${node.readonly ? "var(--bench-400)" : "var(--bench-200)"}">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z"/></svg>
-      </span>
-      <span>${esc(node.name)}</span>
-      <span class="sz">${node.size > 1024 ? (node.size / 1024).toFixed(1) + " K" : node.size + " B"}</span>
-      ${uploadingHere ? `<span class="up"><i style="width:${uploading.pct}%"></i></span>` : ""}
-    </div>`);
-  }
-}
+/* 這裡原本有一棵寫死的示範檔案樹（TREE / treeRow），已經移除。
+   它的設計與資料形狀保存在 web/mock/index.html，要接上時從那裡抄。
+   要變成真的需要 Web Serial 版的 MicroPython raw REPL：
+   `os.ilistdir()` 讀目錄、`open(...,'rb')` 讀檔、寫入走 `.tmp` → rename。
+   協定已經在 Python 版驗證過，見 docs/PYTHON-ARCHITECTURE.md 第 4 節。 */
 
 function renderSide() {
   const isDevice = S.view === "device" || S.view === "monitor";
@@ -729,45 +784,78 @@ function renderSide() {
   const b = S.board, body = $("#side-body"), foot = $("#side-foot");
 
   if (!S.connected) {
-    body.innerHTML = `<p style="color:var(--bench-400);margin:0 0 12px">尚未連線裝置。連線後這裡會顯示晶片資訊與裝置上的檔案。</p>
+    body.innerHTML = `<p style="color:var(--bench-400);margin:0 0 12px;line-height:1.7">
+        尚未連線裝置。<br><br>
+        連線之後這裡會顯示<b style="color:var(--bench-200)">真實</b>的晶片資訊
+        （esptool 讀回來的），但裝置上的檔案還需要 MicroPython 的 raw REPL —— 那尚未接上。
+      </p>
       <button class="btn primary" data-act="connect" style="width:100%;justify-content:center">連線裝置</button>`;
     foot.innerHTML = "";
     return;
   }
 
   if (isDevice) {
-    const fsUse = 34, heapUse = 42;
+    // ⚠ 側欄**只放摘要**，完整的事實在「裝置」頁（renderDeviceView）。
+    // 同一個清單畫兩次會不同步 —— 改了其中一邊另一邊就開始說謊。
+    const chipIsReal = /\(revision/i.test(String(b.chip || ""));
     body.innerHTML = `
       <dl class="dl">
-        <dt>Chip</dt><dd>${esc(b.chip)}</dd>
-        <dt>MAC</dt><dd>${esc(b.mac)}</dd>
-        <dt>Port</dt><dd>${esc(b.port)} · ${b.baud.toLocaleString()}</dd>
-        <dt>Flash</dt><dd>${esc(b.flash)} · dio · 80 MHz</dd>
-        <dt>Firmware</dt><dd style="color:var(--solder)">${esc(b.fw)}</dd>
+        <dt>Chip</dt><dd>${esc(b.chip || "—")}</dd>
+        <dt>MAC</dt><dd>${esc(b.mac || "—")}</dd>
+        <dt>USB</dt><dd>${esc(b.usbLabel || "—")}</dd>
+        <dt>USB ID</dt><dd>${esc(b.port || "—")}</dd>
+        ${awaitBackendInfo()?.device
+          ? `<dt>埠號</dt><dd style="color:var(--led)">${esc(awaitBackendInfo().device)}</dd>`
+          : ""}
       </dl>
-      <div class="section-t"><span class="label">檔案系統</span></div>
-      <div class="mono" style="font-size:11px">1.34 MB 可用 / 2.0 MB
-        <div class="meter"><i style="width:${fsUse}%"></i></div></div>
-      <div class="section-t"><span class="label">記憶體</span></div>
-      <div class="mono" style="font-size:11px">184 KB 可用 / 320 KB
-        <div class="meter"><i style="width:${heapUse}%"></i></div></div>
-      <div class="section-t"><span class="label">運作時間</span></div>
-      <div class="mono" style="font-size:11px">00:14:22</div>`;
+      ${awaitBackendInfo()?.device ? "" : `
+        <div style="font-size:11px;color:var(--bench-400);margin-top:12px;line-height:1.7">
+          <b style="color:var(--amber)">看不到 COM 埠號是正常的</b> ——
+          Web Serial 只給 USB ID。埠號請看系統的裝置選擇對話框，
+          或跑 <span class="mono">python -m mptools</span>。
+        </div>`}
+      ${S.connected && !chipIsReal ? `
+        <div class="warnbox" style="margin-top:14px">
+          <div class="t">裝置不在 bootloader</div>
+          <div class="d">esptool 讀不到晶片細節。按一下 BOOT 再按 RESET 就會進 bootloader。</div>
+        </div>` : ""}
+      <div class="section-t"><span class="label">尚未接上</span></div>
+      <div style="font-size:11px;color:var(--bench-400);border-left:2px solid var(--bench-700);
+          padding:2px 0 2px 8px;line-height:1.8">
+        裝置上的檔案、記憶體用量、檔案系統容量都需要 MicroPython 的
+        <span class="mono">raw REPL</span>，還沒接上。<br>
+        完整的事實請看「裝置」頁。
+      </div>`;
     foot.innerHTML = `
-      <button class="btn sm" data-act="soft-reset">軟重置</button>
-      <button class="btn sm" data-act="bootloader">進 bootloader</button>
-      <button class="btn sm amber" data-act="wipe">抹除檔案系統</button>`;
+      <button class="btn sm" data-act="connect">重新連線</button>
+      <button class="btn sm" data-act="disconnect">中斷</button>`;
     return;
   }
 
-  // 檔案樹（根節點不畫自己，直接畫它的子項）
-  const out = [];
-  TREE.children.forEach((c) => treeRow(c, 0, out));
-  body.innerHTML = `<div class="tree">${out.join("")}</div>`;
+  // 檔案樹。
+  //
+  // ⚠ **不要顯示示範檔案樹。** 使用者連上真裝置時，看到 `main.py` / `lib/sensor.py`
+  // 會以為那是他板子上的檔案 —— 那些是寫死的，而且可能與實物完全不同
+  // （實測某塊 ESP32-S3 上只有 `boot.py`）。讀裝置目錄需要 raw REPL，還沒接上。
+  // 示範資料的設計保存在 web/mock/index.html。
+  body.innerHTML = `
+    <div style="font-size:11px;color:var(--bench-400);border-left:2px solid var(--bench-700);
+        padding:8px 0 8px 10px;line-height:1.7">
+      讀裝置上的檔案需要 MicroPython 的 <span class="mono">raw REPL</span>，
+      而那<b style="color:var(--bench-200)">尚未接上</b>。<br><br>
+      這裡刻意<b style="color:var(--bench-200)">不顯示示範資料</b> ——
+      假檔案樹會讓你以為那就是你板子上的內容。
+    </div>
+    ${S.connected ? `
+      <div class="section-t" style="margin-top:16px"><span class="label">目前裝置</span></div>
+      <div class="mono" style="font-size:11px;line-height:1.8">
+        ${esc(S.board.chip || "未知晶片")}<br>
+        ${esc(S.board.usbLabel || "")}<br>
+        ${esc(S.board.port || "")}
+      </div>` : ""}`;
   foot.innerHTML = `
-    <button class="btn sm" data-act="refresh">⟳ 重新整理</button>
-    <button class="btn sm" data-act="upload">⬆ 上傳</button>
-    <button class="btn sm" data-act="download-all">⬇ 全部下載</button>`;
+    <button class="btn sm" data-act="connect">連線裝置</button>
+    ${S.connected ? `<button class="btn sm" data-act="disconnect">中斷</button>` : ""}`;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -792,49 +880,34 @@ function renderEmptyCanvas() {
   </div></div>`;
 }
 
-const CODE = [
-  `<span class="c"># main.py — 讀 DHT22 並顯示在 OLED 上</span>`,
-  ``,
-  `<span class="k">import</span> <span class="f2">json</span>          <span class="c"># ① 這行會先跑，裝置上沒有 json 時會噴 ImportError</span>`,
-  `<span class="k">import</span> <span class="f2">machine</span>, <span class="f2">time</span>, <span class="f2">dht</span>`,
-  `<span class="k">from</span> <span class="f2">machine</span> <span class="k">import</span> Pin, I2C`,
-  ``,
-  `<span class="f2">sensor</span> <span class="op">=</span> dht.<span class="f2">DHT22</span>(Pin(<span class="n">4</span>))`,
-  `<span class="f2">i2c</span> <span class="op">=</span> <span class="f2">I2C</span>(<span class="n">0</span>, scl<span class="op">=</span>Pin(<span class="n">22</span>), sda<span class="op">=</span>Pin(<span class="n">21</span>))`,
-  ``,
-  `<span class="k">while</span> <span class="k">True</span>:`,
-  `    <span class="k">try</span>:`,
-  `        sensor.<span class="f2">measure</span>()`,
-  `        <span class="f2">t</span>, <span class="f2">h</span> <span class="op">=</span> sensor.<span class="f2">temperature</span>(), sensor.<span class="f2">humidity</span>()`,
-  `        <span class="f2">print</span>(<span class="s">"temp={:.1f}C hum={:.1f}%"</span>.<span class="f2">format</span>(t, h))`,
-  `    <span class="k">except</span> <span class="f2">OSError</span> <span class="k">as</span> e:`,
-  `        <span class="f2">print</span>(<span class="s">"讀取失敗"</span>, e)   <span class="c"># ② 裝置端噴錯時會回報到這一行</span>`,
-  `    time.<span class="f2">sleep</span>(<span class="n">2</span>)             <span class="c"># ③ 目前游標所在行</span>`,
-];
+/* 這裡原本有一份寫死的示範程式（CODE：DHT22 範例 + 假的行號與錯誤波浪線），
+   已經移除。它的設計保存在 web/mock/index.html。
+
+   要讓編輯器變成真的需要：
+     1. raw REPL 讀出裝置上的 .py 檔（`open(path,'rb').read()`）
+     2. 一個真正的編輯器（CodeMirror 6 + @codemirror/lang-python）
+     3. 存回裝置走 `.tmp` → rename 的原子寫法（寫到一半斷電不會毀掉 main.py）
+
+   見 docs/PYTHON-ARCHITECTURE.md 第 4 節與 docs/PLAN.md 的 Task 9–10。 */
 
 function renderEditor() {
-  const gutter = CODE.map((_, i) => `<div>${i + 1}</div>`).join("");
-  const lines = CODE.map((l, i) =>
-    `<div class="${i === 16 ? "cur" : ""}">${l || "&nbsp;"}</div>`).join("");
-  return `
-    <div class="tabs">
-      <button class="f" aria-selected="true"><span class="dirty"></span>main.py<span class="x">×</span></button>
-      <button class="f" aria-selected="false">boot.py<span class="x">×</span></button>
-      <button class="f" aria-selected="false">lib/sensor.py<span class="x">×</span></button>
-      <button class="f" aria-selected="false" style="color:var(--bench-400)">ssd1306.mpy <span class="chip" style="font-size:9px">唯讀</span><span class="x">×</span></button>
-      <div style="flex:1"></div>
-      <button class="btn ghost sm" data-act="run" title="Ctrl-Enter">▶ 執行選取</button>
-      <button class="btn ghost sm" data-act="save" title="Ctrl-S">儲存到裝置</button>
+  return `<div class="pad">
+    ${stubBanner(
+      "編輯器",
+      "Web Serial 版的 MicroPython raw REPL（讀寫裝置上的 .py 檔），以及 CodeMirror 6",
+    )}
+    <div style="border:1px dashed var(--bench-700);border-radius:8px;padding:40px 24px;text-align:center">
+      <div style="font:500 14px/1.4 var(--ui);color:var(--bench-200)">編輯器尚未接上</div>
+      <div style="color:var(--bench-400);font-size:12px;margin-top:10px;line-height:1.8;text-align:left;
+        display:inline-block;max-width:520px">
+        連上裝置之後，這裡會顯示裝置上真實的 <span class="mono">.py</span> 檔。<br>
+        在那之前這裡是空的 —— <b style="color:var(--bench-200)">刻意不放示範程式碼</b>，
+        因為一段看起來合理的程式會讓人以為那是自己板子上的內容。<br><br>
+        版面與元件的設計（分頁列、行號、錯誤波浪線）保存在
+        <span class="mono">web/mock/index.html</span>。
+      </div>
     </div>
-    <div class="code">
-      <div class="gutter">${gutter}</div>
-      <div class="lines">${lines}</div>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;padding:0 16px 14px 16px;border-bottom:1px solid var(--bench-700)">
-      <span class="inline-err mono" style="font-size:11px">⚠ 第 2 行 · <span class="wave">ImportError</span>: no module named 'json' — 裝置回報的 traceback 已對到這一行</span>
-      <div style="flex:1"></div>
-      <button class="btn sm" data-act="goto-line">跳到第 2 行 ↑</button>
-    </div>`;
+  </div>`;
 }
 
 /* ★ 設計簽名：FLASH MAP ───────────────────────────────────────────────
@@ -926,23 +999,75 @@ function renderFlashMap() {
         : `<span class="chip">待機</span>`}
       <span class="mono" style="font-size:11px;color:var(--bench-400)">
         ${esc(w.chip || (board ? `${board.chip}（${board.flashSizeMB} MB）` : "未選板子"))}
-        · baud ${w.baudrate} · reset ${esc(w.resetMode)}
+        · baud ${w.baudrate}
+        · reset ${w.isUsbJtag ? "usb_reset（USB-JTAG 自動）" : esc(w.resetMode)}
       </span>
       <span class="rate">${rateText}</span>
     </div>
   </div>`;
 }
 
-/* 板子清單來自 catalog.js（真實資料，含已驗證的固件 URL 與燒錄位址）。
-   原本這裡是寫死的展示用陣列，已經移除。 */
+/** 板子清單來自 catalog.js（真實資料，含已驗證的固件 URL 與燒錄位址）。 */
+/**
+ * 只更新進度相關的 DOM，**不重繪整個畫面**。
+ *
+ * ══ 為什麼不直接 renderCanvas() ═══════════════════════════════════════
+ *
+ * esptool 的 `reportProgress` 每個區塊都會呼叫（一個 1.7 MB 的固件會呼叫幾十次）。
+ * 每次重繪整個 `.wiz` 會讓畫面閃爍、捲動位置跳掉、輸入焦點消失。
+ * 所以進度只碰兩個元素。
+ *
+ * 這個函式原本漏掉了（我在覆蓋檔案時弄丟），症狀是**進度條完全不動** ——
+ * 燒錄其實在跑，但使用者看到的永遠是 0%。
+ */
+function renderProgress() {
+  const w = S.wizard;
+  const percent = w.phase === "done" ? 100 : (w.progress || 0);
+  const fill = $("#prog-fill");
+  if (fill) {
+    fill.style.width = `${percent}%`;
+    fill.style.background =
+      w.phase === "error" ? "var(--danger)" : w.phase === "done" ? "var(--led)" : "var(--amber)";
+  }
+  const pct = $("#prog-pct");
+  if (pct) pct.textContent = `${percent.toFixed(1)}%`;
+  const rate = $("#prog-rate");
+  if (rate) {
+    rate.textContent =
+      formatRate(w.rate || 0) + (w.eta != null ? ` · 剩 ~${Math.round(w.eta)}s` : "");
+  }
+  // Flash Map 的區塊填充
+  document.querySelectorAll('.fm-seg[data-main="1"]').forEach((node) => {
+    const bar = node.querySelector(".fill");
+    if (!bar) return;
+    node.dataset.status =
+      w.phase === "done" ? "done" : w.phase === "error" ? "error" : "writing";
+    bar.style.width = `${percent}%`;
+  });
+}
 
 function renderFlash() {
   const w = S.wizard;
   const stepState = (i) => (w.step === i ? "now" : w.step > i ? "done" : "todo");
   const stepLabels = ["選裝置", "選固件", "選項", "燒錄"];
+
+  /**
+   * 目前選到的板子。
+   *
+   * ⚠️ **一定要在函式頂部宣告一次。**
+   *
+   * 這裡原本在 step 1 與 step 2 的分支裡各自 `const selected = …`，
+   * 然後 step 3 的分支用了 `selected` —— **兩個都不在它的作用域裡**，
+   * 於是「選項」這一步整個拋 `ReferenceError: selected is not defined`。
+   *
+   * 而且 `tools/check-undefined.mjs` 那時也抓不到：它只檢查「被呼叫」(`foo(`)
+   * 與「被取屬性」(`foo.bar`) 的裸識別碼，而 `${selected && …}` 兩種都不是。
+   * 檢查器已經補上「裸識別碼」的檢查（見那個檔案的說明）。
+   */
+  const selected = w.boardId ? findBoard(w.boardId) : null;
+
   let bodyHtml = "";
   if (w.step === 1) {
-    const selected = w.boardId ? findBoard(w.boardId) : null;
     const portLine = S.connected
       ? `${esc(S.board.port || "序列埠")} · ${esc(S.board.chip || "未知晶片")}`
       : "尚未連線 —— 按上方「連線裝置」。**燒錄時會在需要時才跳出挑埠對話框。**";
@@ -974,7 +1099,7 @@ function renderFlash() {
           · reset ${esc(w.resetMode)}</div>
       </div></div>` : ""}`;
   } else if (w.step === 2) {
-    const selected = w.boardId ? findBoard(w.boardId) : null;
+    // `selected` 在函式頂部宣告一次，三個步驟共用（見那裡的說明）
     const variants = selected?.firmware ?? [];
     bodyHtml = `
       <div class="srcs">
@@ -1037,13 +1162,37 @@ function renderFlash() {
       <div class="card"><div class="card-b">
         <div class="mono" style="font-size:11px;color:var(--bench-400)">
           baud rate <b style="color:var(--bench-200)">${w.baudrate}</b>
-          · reset mode <b style="color:var(--bench-200)">${esc(w.resetMode)}</b>
+          · reset mode <b style="color:var(--bench-200)">${w.isUsbJtag ? "usb_reset（USB-JTAG 自動）" : esc(w.resetMode)}</b>
           · flash mode / freq / size 一律 <b style="color:var(--bench-200)">keep</b>（不變更裝置現有設定）
         </div>
       </div></div>`;
   } else {
+    // 步驟 4：Flash Map + 進度條 + esptool 輸出
+    const total = w.firmwareData?.length || w.firmwareSize || 0;
     bodyHtml = `
       ${renderFlashMap()}
+      ${w.firmwareData ? `
+      <div class="card" style="margin-top:12px"><div class="card-b">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px">
+          <span class="mono" style="font-size:12px">${esc(w.firmwareName || "")}</span>
+          <span class="mono" style="font-size:12px" id="prog-pct">${w.phase === "done" ? "100.0%" : `${(w.progress || 0).toFixed(1)}%`}</span>
+        </div>
+        <div style="height:6px;border-radius:99px;background:var(--bench-800);overflow:hidden;margin-top:8px">
+          <div id="prog-fill" style="height:100%;width:${w.phase === "done" ? 100 : (w.progress || 0)}%;
+            background:${w.phase === "error" ? "var(--danger)" : w.phase === "done" ? "var(--led)" : "var(--amber)"};
+            transition:width 120ms linear"></div>
+        </div>
+        <div class="mono" style="font-size:11px;color:var(--bench-400);margin-top:8px;
+          display:flex;gap:12px;justify-content:space-between">
+          <span>${formatBytes(total)}${w.eraseAll ? " · 先抹除整個 flash" : ""}${w.resetAfter !== false ? " · 完成後重置" : ""}</span>
+          <span id="prog-rate">${formatRate(w.rate || 0)}${w.eta != null ? ` · 剩 ~${Math.round(w.eta)}s` : ""}</span>
+        </div>
+      </div></div>` : `
+      <div class="card" style="margin-top:12px"><div class="card-b">
+        <div style="color:var(--amber)">還沒有固件檔</div>
+        <div style="color:var(--bench-400);font-size:12px;margin-top:6px">
+          回上一步下載官方固件並拖進來，或選擇本機檔案。</div>
+      </div></div>`}
       ${w.failure ? renderFailurePanel(w.failure) : ""}
       <div class="card" style="margin-top:12px">
         <div class="card-h"><span class="label">esptool 輸出</span>
@@ -1102,85 +1251,242 @@ function renderFailurePanel(failure) {
   </div>`;
 }
 
-const PKGS = [
-  { n: "dht",      d: "DHT11 / DHT22 溫濕度感測器", v: "1.0.0", s: "installed" },
-  { n: "ssd1306",  d: "SSD1306 OLED 顯示器驅動", v: "1.0.0", s: "installed" },
-  { n: "umqtt.simple", d: "輕量 MQTT 客戶端", v: "1.0.0", s: "none" },
-  { n: "urequests", d: "HTTP 請求（requests 子集）", v: "0.9.0", s: "none" },
-  { n: "bme280",   d: "BME280 氣壓／溫濕度感測器", v: "1.0.0", s: "none" },
-  { n: "neopixel", d: "WS2812 / NeoPixel 燈條", v: "1.0.0", s: "installed" },
-  { n: "machine",  d: "內建模組（無法移除）", v: "builtin", s: "builtin" },
-];
+/* 這裡原本有一份寫死的套件清單（PKGS：dht / ssd1306 / umqtt.simple …）與狀態，
+   已經移除。設計保存在 web/mock/index.html。
+
+   要變成真的需要：
+     1. raw REPL 執行裝置上的 `mip.install("...")`
+     2. 從 micropython.org/pi/v2/index.json 抓套件索引
+     3. 列出裝置 `/lib` 底下已安裝的模組（`os.ilistdir('/lib')`） */
 
 function renderPackages() {
   return `<div class="pad">
+    ${stubBanner("套件管理", "Web Serial 版的 raw REPL + 裝置上的 mip 模組 + micropython.org/pi 索引")}
     <h1 style="font:600 20px/1.2 var(--font-display);color:var(--bench-100);margin:0 0 4px">套件管理</h1>
-    <p style="color:var(--bench-400);margin:0 0 16px">透過裝置上的 <span class="mono">mip</span> 直接安裝到 <span class="mono">/lib</span>，不需要先把板子拔下來。</p>
-    <input class="search" placeholder="搜尋套件（micropython.org/pi 索引 + 裝置端已安裝）" id="pkg-search">
-    <div class="plist">
-      ${PKGS.map((p) => `<div class="r" data-pkg="${esc(p.n)}">
-        <div class="grow"><div class="nm">${esc(p.n)}</div><div class="ds">${esc(p.d)}</div></div>
-        <span class="ver">${esc(p.v)}</span>
-        ${p.s === "installed" ? `<span class="chip led">已安裝</span><button class="btn ghost sm" data-act="pkg-remove">移除</button>`
-          : p.s === "builtin" ? `<span class="chip">內建</span>`
-          : `<button class="btn sm" data-act="pkg-install">安裝</button>`}
-      </div>`).join("")}
+    <p style="color:var(--bench-400);margin:0 0 20px">透過裝置上的 <span class="mono">mip</span> 直接安裝到 <span class="mono">/lib</span>。</p>
+    <div style="border:1px dashed var(--bench-700);border-radius:8px;padding:40px 24px;text-align:center">
+      <div style="font:500 14px/1.4 var(--ui);color:var(--bench-200)">套件清單尚未接上</div>
+      <div style="color:var(--bench-400);font-size:12px;margin-top:10px;line-height:1.8;text-align:left;
+        display:inline-block;max-width:520px">
+        這裡會列出<b style="color:var(--bench-200)">你裝置上實際安裝的</b>模組，
+        以及 micropython.org 套件索引裡可安裝的項目。<br>
+        在那之前這裡是空的 —— 一份看起來合理的套件清單會讓人以為自己裝過那些東西。
+      </div>
     </div>
   </div>`;
 }
 
 function renderMonitor() {
   return `<div class="pad">
+    ${stubBanner("序列埠監控", "Web Serial 版的 raw REPL（讀裝置吐出的 print() 輸出並繪圖）")}
     <h1 style="font:600 20px/1.2 var(--font-display);color:var(--bench-100);margin:0 0 4px">序列埠監控</h1>
-    <p style="color:var(--bench-400);margin:0 0 16px">自動解析裝置 <span class="mono">print()</span> 出來的 <span class="mono">key=value</span> 或 CSV，即時繪圖。<span class="mono">dht</span> 套件已安裝，讀值正常。</p>
-    <div class="chartbox">
-      <div class="legend">
-        <span><i style="background:var(--led)"></i>temperature (°C)</span>
-        <span><i style="background:var(--solder)"></i>humidity (%)</span>
-        <span><i style="background:var(--amber)"></i>heap free (KB)</span>
-        <span style="margin-left:auto">2.0 s / 點 · 最近 120 點</span>
+    <p style="color:var(--bench-400);margin:0 0 20px">解析裝置 <span class="mono">print()</span> 出來的 <span class="mono">key=value</span> 或 CSV，即時繪圖。</p>
+    <div style="border:1px dashed var(--bench-700);border-radius:8px;padding:40px 24px;text-align:center">
+      <div style="font:500 14px/1.4 var(--ui);color:var(--bench-200)">還沒有資料</div>
+      <div style="color:var(--bench-400);font-size:12px;margin-top:10px;line-height:1.8;text-align:left;
+        display:inline-block;max-width:520px">
+        要看到圖，裝置必須正在跑、而且持續 <span class="mono">print()</span> 出可解析的數值。<br>
+        在那之前這裡是空的 —— <b style="color:var(--bench-200)">刻意不放示範折線圖</b>，
+        因為一張會動的圖看起來就像真的在讀資料。
       </div>
-      <canvas id="chart" height="240"></canvas>
     </div>
-    <div class="card" style="margin-top:14px"><div class="card-b" style="display:flex;gap:24px;align-items:center;flex-wrap:wrap">
-      <div><div class="label">目前溫度</div><div class="mono" style="font-size:20px;color:var(--led)" id="mv-t">24.6 °C</div></div>
-      <div><div class="label">目前濕度</div><div class="mono" style="font-size:20px;color:var(--solder)" id="mv-h">58.2 %</div></div>
-      <div><div class="label">可用記憶體</div><div class="mono" style="font-size:20px;color:var(--amber)" id="mv-m">184 KB</div></div>
-      <div><div class="label">取樣數</div><div class="mono" style="font-size:20px;color:var(--bench-200)" id="mv-n">1 284</div></div>
-      <div style="flex:1"></div>
-      <button class="btn sm" data-act="export-csv">匯出 CSV</button>
-    </div></div>
   </div>`;
 }
 
+/**
+ * 裝置面板用的兩個小工具。**放在模組層級**，不要在 render 函式裡面定義 ——
+ * 這已經咬過一次：`portPanel()` 用了 `renderDeviceView()` 裡的區域變數 `row`，
+ * 結果整個「裝置」頁拋 `ReferenceError`，而 console 只有那一行。
+ *
+ * 這種錯啟動自我檢查抓不到（它只驗 DOM id 與狀態欄位，不做跨函式的變數分析），
+ * 所以唯一的防線是：**共用的東西就放模組層級**。
+ */
+function dlRow(label, value) {
+  return value
+    ? `<dt>${label}</dt><dd>${esc(value)}</dd>`
+    : `<dt>${label}</dt><dd style="color:var(--bench-400)">—</dd>`;
+}
+
+/** 「這需要 raw REPL，還沒接上」的說明區塊。 */
+function replNeeded(what) {
+  return `<div style="font-size:11px;color:var(--bench-400);border-left:2px solid var(--bench-700);
+     padding:2px 0 2px 8px">需要 MicroPython REPL 才能讀取${what} ——
+     <b style="color:var(--bench-200)">尚未接上</b></div>`;
+}
+
+/* 這裡原本有一份「裝置詳情」的示範（假的 MAC、1.34 MB / 184 KB / 41 °C 儀表、
+   假的動作按鈕），已經移除。設計保存在 web/mock/index.html。
+
+   現在只顯示**真的讀到的東西**：esptool 連線時從裝置拿到的晶片資訊。
+   底下那些（檔案系統、記憶體、平台細節）需要 raw REPL，還沒接上。 */
 function renderDeviceView() {
   if (!S.connected) return renderEmptyCanvas();
+  const b = S.board;
+
   return `<div class="pad">
-    <h1 style="font:600 20px/1.2 var(--font-display);color:var(--bench-100);margin:0 0 4px">${esc(S.board.name)}</h1>
-    <p style="color:var(--bench-400);margin:0 0 20px">連線正常，讀數每 2 秒更新一次（裝置忙碌時暫停輪詢）。</p>
-    <div class="card"><div class="card-h"><span class="label">晶片</span></div><div class="card-b">
-      <dl class="dl">
-        <dt>Chip</dt><dd>${esc(S.board.chip)}</dd>
-        <dt>MAC</dt><dd>${esc(S.board.mac)}</dd>
-        <dt>Port</dt><dd>${esc(S.board.port)} · ${S.board.baud.toLocaleString()} baud</dd>
-        <dt>Flash</dt><dd>${esc(S.board.flash)} · dio · 80 MHz</dd>
-        <dt>Firmware</dt><dd style="color:var(--solder)">${esc(S.board.fw)}</dd>
-        <dt>Platform</dt><dd>esp32 · ESP32-S3 · 240 MHz · 2 cores</dd>
-      </dl></div></div>
-    <div class="card"><div class="card-h"><span class="label">健康狀態</span></div><div class="card-b">
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:20px">
-        <div><div class="label">檔案系統 1.34 / 2.0 MB</div><div class="meter"><i style="width:34%"></i></div></div>
-        <div><div class="label">記憶體 184 / 320 KB</div><div class="meter"><i style="width:42%"></i></div></div>
-        <div><div class="label">CPU 溫度 41 °C</div><div class="meter" data-tone="amber"><i style="width:52%"></i></div></div>
-      </div></div></div>
-    <div class="card"><div class="card-h"><span class="label">動作</span></div><div class="card-b" style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn sm" data-act="soft-reset">軟重置</button>
-      <button class="btn sm" data-act="bootloader">進入 bootloader</button>
-      <button class="btn sm" data-act="snapshot">下載裝置快照（全部檔案打包）</button>
-      <button class="btn sm amber" data-act="wipe">抹除檔案系統</button>
-      <button class="btn sm amber" data-act="factory">恢復出廠固件</button>
-    </div></div>
+    <h1 style="font:600 20px/1.2 var(--font-display);color:var(--bench-100);margin:0 0 4px">
+      ${esc(b.chip || "已連線的裝置")}</h1>
+    <p style="color:var(--bench-400);margin:0 0 20px">
+      以下是 esptool 連線時從裝置讀回來的<b style="color:var(--bench-200)">真實資料</b>。
+    </p>
+
+    ${portPanel()}
+
+    <div class="card"><div class="card-h"><span class="label">esptool 讀到的</span></div>
+      <div class="card-b">
+        <dl class="dl">
+          ${dlRow("Chip", b.chip)}
+          ${dlRow("MAC", b.mac)}
+          ${dlRow("Features", b.features)}
+          ${dlRow("Crystal", b.crystalMHz ? `${b.crystalMHz} MHz` : null)}
+          ${dlRow("Flash ID", b.flashId)}
+          ${dlRow("USB ID", b.port)}
+          ${dlRow("USB 裝置", b.usbLabel)}
+          ${dlRow("Baud", b.baud ? b.baud.toLocaleString() : null)}
+        </dl>
+        ${!b.chip || !/\(revision/i.test(String(b.chip)) ? `
+          <div class="warnbox" style="margin-top:14px">
+            <div class="t">裝置不在 bootloader，所以讀不到晶片細節</div>
+            <div class="d">要燒錄請按一下 BOOT 再按 RESET（或直接按「燒錄」讓 esptool 用
+              usb_reset 自己試）。</div>
+          </div>` : ""}
+      </div></div>
+
+    <div class="card"><div class="card-h"><span class="label">需要 raw REPL 的部分</span></div>
+      <div class="card-b">
+        ${replNeeded("裝置上的檔案")}
+        <div style="height:10px"></div>
+        ${replNeeded("記憶體用量（gc.mem_free）")}
+        <div style="height:10px"></div>
+        ${replNeeded("檔案系統容量（os.statvfs）")}
+      </div></div>
+
+    <div class="card"><div class="card-h"><span class="label">動作</span></div>
+      <div class="card-b" style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn sm" data-act="connect">重新連線</button>
+        <button class="btn sm" data-act="disconnect">中斷</button>
+        <button class="btn sm" data-act="release-ports">釋放序列埠（卡住時用）</button>
+      </div>
+      <div class="card-b" style="border-top:1px solid var(--bench-700);
+        font-size:11px;color:var(--bench-400);line-height:1.7">
+        軟重置 / 抹除檔案系統 / 下載快照這些動作需要 raw REPL，所以這裡還沒有。
+        燒錄請到「燒錄」頁 —— 那條路是真的。
+      </div></div>
   </div>`;
+}
+
+/**
+ * 「我到底接在哪個埠？」—— 這是純網頁版**做不到**的事，所以要把原因講清楚。
+ *
+ * ══ 為什麼瀏覽器不知道 COM 號碼 ═══════════════════════════════════════
+ *
+ * `SerialPort.getInfo()` 只回傳兩個欄位：
+ *
+ *     { usbVendorId, usbProductId }
+ *
+ * 沒有 COM 號碼、沒有序號、沒有 USB 拓撲位置（location）。這是規格就沒給，
+ * 不是我們沒接。所以：
+ *
+ *   · 網頁版只能顯示 USB ID（`303A:1001`）
+ *   · 那個**不是**埠號 —— 兩塊一樣的板子會顯示同樣的值
+ *
+ * 想知道 COM 號碼有兩條路：
+ *   1. 用本機服務（`python -m mptools`）—— 它用 pyserial，看得到完整資訊
+ *   2. 網頁版：按「重新連線」時，**系統的裝置選擇對話框裡會顯示埠號**
+ */
+function portPanel() {
+  const b = S.board;
+  const backend = awaitBackendInfo();
+
+  return `<div class="card"><div class="card-h">
+      <span class="label">連接的埠</span>
+      ${backend ? `<span class="chip led">本機服務已連線</span>` : ""}
+    </div>
+    <div class="card-b">
+      ${backend ? `
+        <dl class="dl">
+          ${dlRow("埠號", backend.device)}
+          ${dlRow("USB 晶片", backend.boardLabel)}
+          ${dlRow("序號", backend.serialNumber)}
+          ${dlRow("位置", backend.location)}
+        </dl>
+        <div style="font-size:11px;color:var(--bench-400);margin-top:10px;line-height:1.7">
+          這是本機服務（<span class="mono">python -m mptools</span>）用 pyserial 讀到的
+          —— 網頁本身拿不到這些。
+        </div>` : `
+        <div style="font-size:12px;color:var(--bench-200)">
+          USB ID <span class="mono">${esc(b.port || "—")}</span>
+          <span style="color:var(--bench-400)">（這不是埠號）</span>
+        </div>
+        <div style="font-size:11px;color:var(--bench-400);margin-top:10px;line-height:1.8">
+          <b style="color:var(--amber)">瀏覽器不會告訴網頁「是 COM 幾」。</b>
+          Web Serial 的 <span class="mono">getInfo()</span> 只回傳 USB 廠商與產品 ID，
+          沒有埠號、沒有序號。兩塊一樣的板子會顯示同樣的值。<br><br>
+          <b style="color:var(--bench-200)">想知道埠號，兩個辦法：</b><br>
+          1. 按「重新連線」—— 系統的裝置選擇對話框裡會顯示（例如
+             <span class="mono">USB Serial Device (COM26)</span>）<br>
+          2. 跑本機服務：<span class="mono">python -m mptools</span> ——
+             它用 pyserial，看得到完整清單與佔用狀況
+        </div>`}
+    </div></div>`;
+}
+
+/**
+ * 本機服務（選配）的資訊。**沒有跑就是 null，不要假裝有。**
+ *
+ * 這個服務用 pyserial，所以拿得到瀏覽器拿不到的東西：埠號、序號、USB 位置、
+ * 以及「這個埠被哪個程式佔用」。它是純網頁版的補強，不是必要依賴。
+ */
+let backendInfo = null;
+function awaitBackendInfo() {
+  return backendInfo;
+}
+
+/** 本機服務預設的埠。`python -m mptools` 用這個。 */
+const BACKEND_PORT = "8765";
+
+/**
+ * 探測本機服務。**只有在有機會成功的時候才探。**
+ *
+ * ══ 為什麼要判斷埠號 ═══════════════════════════════════════════════════
+ *
+ * 第一版無條件打 `/api/health`。用靜態伺服器（`python -m http.server`）開的時候，
+ * 那個路徑不存在，於是每一次載入頁面都在 console 留一行紅色：
+ *
+ *     GET http://127.0.0.1:8807/api/health 404 (File not found)
+ *
+ * 那不是錯誤 —— 靜態託管**本來就沒有後端**。但一行紅字會讓真正的問題被忽略，
+ * 而且我們沒辦法阻止瀏覽器記錄失敗的請求（`fetch` 的 catch 攔不到 console）。
+ *
+ * 所以：**只有當頁面是從本機服務的埠載入時才探。**
+ * 其他情況（靜態伺服器、`file://`、桌面殼）直接跳過，console 保持乾淨。
+ */
+async function probeBackend() {
+  if (location.port !== BACKEND_PORT) {
+    // 不是本機服務的埠 —— 不必探，也不可能成功
+    return;
+  }
+  try {
+    const response = await fetch("/api/health", { signal: AbortSignal.timeout(1200) });
+    if (!response.ok) return;
+    const body = await response.json();
+    if (body?.name !== "mp_Tools") return;
+    backendInfo = { service: body };
+    // 服務在跑就順便問它有哪些埠
+    const ports = await fetch("/api/ports", { signal: AbortSignal.timeout(4000) })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (ports?.ports?.length) {
+      // 挑一個跟目前連線的 USB ID 相符的
+      const match = ports.ports.find((p) => p.usbId === S.board.port) ?? ports.ports[0];
+      backendInfo = { service: body, ...match, all: ports.ports };
+    }
+    if (S.view === "device") renderCanvas();
+    if (S.view !== "device" && S.connected) renderSide();
+  } catch {
+    // 服務在預期的埠上但沒回應 —— 這是正常的（使用者可能只開了靜態伺服器在 8765）
+    backendInfo = null;
+  }
 }
 
 function renderCanvas() {
@@ -1191,20 +1497,24 @@ function renderCanvas() {
   else if (v === "monitor") el.innerHTML = S.connected ? renderMonitor() : renderEmptyCanvas();
   else if (v === "packages") el.innerHTML = S.connected ? renderPackages() : renderEmptyCanvas();
   else if (v === "device") el.innerHTML = renderDeviceView();
-  if (v === "monitor" && S.connected) startChart();
+  // 監控頁目前沒有圖表引擎（亂數資料已移除）。要接上時見 web/mock/index.html 的 drawChart。
 }
 
 /* ══════════════════════════════════════════════════════════════════════
    REPL 終端
    ══════════════════════════════════════════════════════════════════════ */
-function termLine(html) {
-  const t = $("#term");
-  const d = document.createElement("div");
-  d.innerHTML = html;
-  t.appendChild(d);
-  t.scrollTop = t.scrollHeight;
-  return d;
-}
+
+/* 這裡原本有一段寫死的 MicroPython banner 與對話（`MicroPython v1.25.0 on …`、
+   `machine.freq()` → `240000000`），已經移除。設計保存在 web/mock/index.html。
+
+   要變成真的需要 Web Serial 版的 raw REPL 協定，而且**三個坑都已經知道了**
+   （見 docs/PYTHON-ARCHITECTURE.md 第 4 節）：
+     1. `OK` 黏在 stdout 前面，不是獨立欄位
+     2. `read_until` 必須保留分隔字元之後的殘餘，否則 stdout 永遠讀不到
+     3. `Ctrl-C` 會把裝置踢出 raw REPL，中斷後必須重送 `Ctrl-A`
+   Python 版已經把這三點實作並測試過，移植時照著做就不會再踩。
+
+   ⚠ 不要放示範文字。一段像真的 REPL 對話會讓人以為裝置已經連上了。 */
 function renderTerm() {
   const t = $("#term");
   if (!S.connected) {
@@ -1213,14 +1523,11 @@ function renderTerm() {
     return;
   }
   t.innerHTML = `
-    <div class="out">MicroPython v1.25.0 on 2024-11-29; ESP32-S3 module with ESP32-S3</div>
-    <div class="out">Type "help()" for more information.</div>
-    <div class="out">&gt;&gt;&gt; <span style="color:var(--bench-100)">import machine, time</span></div>
-    <div class="out">&gt;&gt;&gt; <span style="color:var(--bench-100)">machine.freq()</span></div>
-    <div class="out">240000000</div>
-    <div class="out">&gt;&gt;&gt; <span style="color:var(--bench-100)">print("hello from", machine.unique_id().hex())</span></div>
-    <div class="out">hello from 7cdfa1e29b04</div>
-    <div class="out" id="term-tail"><span class="caret"></span></div>`;
+    <div class="dim" style="border-left:2px solid var(--amber);padding-left:8px;line-height:1.8">
+      REPL <b style="color:var(--bench-200)">尚未接上</b> —— 這裡是空的。<br>
+      要讓它動起來需要 Web Serial 版的 raw REPL 協定。<br>
+      <span style="color:var(--bench-400)">端子機（</span><span class="mono" style="color:var(--bench-400)">python -m mptools repl</span><span style="color:var(--bench-400)">）現在就能用。</span>
+    </div>`;
 }
 $("#term").addEventListener("click", () => {});
 
@@ -1232,57 +1539,283 @@ function setStatus(state, text) {
   $("#st-led").dataset.state = state === "off" ? "off" : state;
   $("#st-conn").textContent = text;
 }
+
+/**
+ * 重新填滿裝置條（`#strip-slot`），**同時保住 `#conn-label`**。
+ *
+ * ══ 為什麼需要這支函式 ═════════════════════════════════════════════════
+ *
+ * `#conn-label` 原本住在 `#strip-slot` **裡面**。而 `connect()` 為了顯示
+ * 「正在連線…」會做：
+ *
+ *     $("#strip-slot").innerHTML = `…正在連線…`;
+ *
+ * 那一行把 `#conn-label` **連根刪掉**，於是幾行之後的 `setConnLabel()` 找不到它，
+ * 每次都印 `[ui] #conn-label 不存在`。
+ *
+ * 我加的「找不到就吵鬧地失敗」防護讓這件事**看得見**，但它同時也掩蓋了真相 ——
+ * 看起來像「HTML 被改壞了」，實際上是「HTML 被自己的程式碼清掉了」。
+ *
+ * 所以：**任何改動裝置條的地方都走這支函式**，它會把標籤重新種回去。
+ * 直接寫 `$("#strip-slot").innerHTML = …` 是錯的。
+ */
+function renderStrip(html, label) {
+  const slot = $("#strip-slot");
+  if (!slot) {
+    console.error("[ui] #strip-slot 不存在 —— 檢查 HTML");
+    return;
+  }
+  slot.innerHTML = `${html}<span class="label" id="conn-label" style="color:var(--bench-400)"></span>`;
+  if (label != null) setConnLabel(label, S.connected);
+}
+
+/**
+ * 全域互斥鎖：同一時間只能有一個長時間操作（燒錄、連線、診斷）。
+ *
+ * 序列埠是獨佔資源，兩個操作搶同一個埠的結果是 `The port is already open`，
+ * 而且錯誤訊息完全指不出真正的原因。所以用一個明確的忙碌旗標擋住。
+ *
+ * `S.busy` 同時是「忙碌中嗎」與「在忙什麼」—— UI 要顯示後者，
+ * 使用者才知道為什麼按鈕是灰的。
+ */
+function setBusy(busy, label = "") {
+  S.busy = busy ? { owner: label, label } : null;
+  const hint = $("#st-hint");
+  if (hint) {
+    hint.innerHTML = busy
+      ? `裝置忙碌中：${esc(label)} —— 請勿拔線或關閉頁面`
+      : `按 <kbd>Ctrl K</kbd> 開啟命令面板`;
+  }
+  renderCanvas();
+}
+
+/**
+ * 「這一頁還沒接上」的橫幅。
+ *
+ * ══ 為什麼要這個 ═══════════════════════════════════════════════════════
+ *
+ * 這些畫面的內容是原型時期的**設計稿資料**（寫死的檔案樹、程式碼、套件清單、
+ * 亂數產生的圖表）。留著它們當視覺參考是有用的，但**假資料假裝是真的比缺功能更糟**
+ * —— 使用者沒辦法分辨「184 KB」是真的從板子讀回來的還是寫死的。
+ *
+ * 所以：畫面留著，但明確標示。等真的接上之後把這個橫幅拿掉。
+ */
+function stubBanner(what, howToUnlock) {
+  return `<div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:14px;padding:10px 13px;
+      border:1px dashed var(--bench-600);border-radius:8px;background:rgb(240 165 60 / .05)">
+    <span style="color:var(--amber);flex:0 0 auto;font-size:13px">⚠</span>
+    <div>
+      <div style="color:var(--amber);font-size:12px;font-weight:500">這一頁的內容是設計稿，尚未接上裝置</div>
+      <div style="color:var(--bench-400);font-size:11px;margin-top:4px;line-height:1.6">
+        下面看到的${what}是寫死的示範資料，不是從你的板子讀回來的。
+        ${howToUnlock ? `<br>要變成真的需要：${howToUnlock}` : ""}
+      </div>
+    </div>
+  </div>`;
+}
+
+/**
+ * 目前**真的會動**的功能只有這些。其他地方都是設計稿。
+ * 這個清單是給 UI 與文件共用的單一事實來源 —— 更新功能時要一起改。
+ */
+const IMPLEMENTED = {
+  'flash': true,        // esptool 燒錄（已在你板子上走到 stub + 921600）
+  'connect': true,      // 序列埠取得 + esptool 認晶片
+  'diagnose': true,     // 認出「裝置在跑 MicroPython」
+};
+
+/**
+ * 設定頂部裝置條的文字。
+ *
+ * ══ 這個元素「一直不存在」，而我只加了防護、沒加元素 ═══════════════════
+ *
+ * 原本 `connect()` 寫入 `#conn-label`，但 HTML 裡沒有這個 id → TypeError，
+ * 而那是 async 函式裡的第一行，所以整個連線流程死掉、畫面毫無反應。
+ *
+ * 我當時的修法是加這個「找不到就吵鬧地失敗」的防護 —— 但**忘了把元素加進 HTML**。
+ * 結果變成每次連線都在 console 印一行 `[ui] #conn-label 不存在`，
+ * 卻沒有任何功能壞掉，於是這行錯誤被當成雜訊忽略了好幾輪。
+ *
+ * > 教訓：加防護不等於修好。防護只是讓失敗變得可看見 —— 看見之後還是要修。
+ *
+ * 現在 `<span id="conn-label">` 真的在 `header.strip` 裡面了。
+ */
+function setConnLabel(text, connected = null) {
+  const node = $("#conn-label");
+  if (!node) {
+    // 這行訊息原本寫「檢查 HTML 是否被改壞了」—— **那個判斷是錯的**，
+    // 而且它讓我找錯方向好幾輪。元素確實存在於 HTML，是**執行期被自己的
+    // 程式碼清掉的**：任何直接寫 `$("#strip-slot").innerHTML = …` 的地方
+    // 都會把它連根刪掉（它住在 `#strip-slot` 裡面）。
+    //
+    // 所以訊息要指向真正的兇手。
+    console.error(
+      "[ui] #conn-label 不見了。它在 #strip-slot 裡面，而某處直接改寫了 " +
+      "#strip-slot.innerHTML —— 請改用 renderStrip()，它會把標籤種回去。",
+    );
+    return;
+  }
+  node.textContent = text;
+  if (connected !== null) {
+    node.style.color = connected ? "var(--led)" : "var(--bench-400)";
+  }
+}
+
+/**
+ * 連線裝置。
+ *
+ * ══ 這裡原本是原型的模擬函式 ═══════════════════════════════════════════
+ *
+ * 舊版是 `await sleep(700); …; S.connected = true;` —— 三段假動畫之後
+ * 直接把狀態寫成「已連線」。**它從來沒有碰過 navigator.serial。**
+ * 症狀：按了「連線裝置」畫面說已連線，但選不到任何晶片、板子型號空白、
+ * 序列埠名稱是「—」。
+ *
+ * ══ 現在做的是真的 ═════════════════════════════════════════════════════
+ *
+ * 1. `acquirePort()` → 跳系統的裝置選擇對話框（**必須在使用者手勢中呼叫**）
+ * 2. 用 esptool 認晶片 —— 這一步會失敗，如果裝置在跑 MicroPython。
+ *    失敗時**不要假裝成功**，要跑診斷並老實說。
+ * 3. 只有真的認到東西才設 S.connected = true。
+ */
 async function connect() {
-  if (S.connected) return;
+  if (S.busy) return;
+  if (!S.caps.usable) {
+    toast("err", "這個瀏覽器不能用 Web Serial", S.caps.reason, true);
+    return;
+  }
+
+  setBusy(true, "開啟序列埠");
   setStatus("connecting", "連線中…");
-  $("#strip-activity").textContent = "偵測晶片…";
-  $("#strip-slot").innerHTML = `
+  $("#strip-activity").textContent = "等待選擇序列埠…";
+  renderStrip(`
     <div class="ticket" data-active="true">
       <span class="led" data-state="connecting"></span>
-      <span class="name">正在連線…</span><span class="meta">分析中</span>
-    </div>
-    <span class="label" style="color:var(--bench-400)">步驟 1/3 · 偵測晶片</span>`;
-  renderSide(); renderCanvas();
+      <span class="name">正在連線…</span><span class="meta">開啟序列埠</span>
+    </div>`, "請在對話框中選擇你的開發板");
 
-  await sleep(700);
-  $("#strip-activity").textContent = "偵測固件…";
-  $("#strip-slot").querySelector(".label").textContent = "步驟 2/3 · 讀取固件資訊";
-  await sleep(650);
-  $("#strip-activity").textContent = "讀取裝置資訊…";
-  $("#strip-slot").querySelector(".label").textContent = "步驟 3/3 · 檔案系統";
-  await sleep(600);
+  try {
+    const session = await acquirePort({ reuseAuthorized: true, trace: false });
+    if (!session) {
+      // 使用者按了取消 —— 不是錯誤，回到乾淨的未連線狀態
+      setStatus("off", "未連線");
+      $("#strip-activity").textContent = "";
+      toast("warn", "已取消", "你沒有在對話框中選擇序列埠。再按一次「連線裝置」即可。");
+      S.failure = null;
+      renderSide(); renderCanvas();
+      return;
+    }
 
-  S.connected = true;
-  $("#strip-activity").textContent = "";
-  $("#strip-slot").innerHTML = `
-    <div class="ticket" data-active="true" title="作用中的裝置">
-      <span class="led" data-state="idle"></span>
-      <span class="name">${esc(S.board.name)}</span>
-      <span class="meta">${esc(S.board.port)} · 921600 · 4MB</span>
-    </div>
-    <button class="btn sm" data-act="disconnect">中斷</button>`;
-  setStatus("idle", "已連線");
-  $("#st-chip").textContent = "ESP32-S3 · MicroPython v1.25.0";
-  $("#st-fs").textContent = "檔案系統：4 個檔案 · 已同步";
-  $("#repl-state").innerHTML = `<span class="chip led">就緒</span>`;
-  S.view = "edit";
-  syncNav();
-  renderSide(); renderCanvas(); renderTerm();
-  toast("ok", "已連線 ESP32-S3", "MicroPython v1.25.0 · /lib 內有 2 個模組");
+    flashRuntime.session = session;
+    const described = session.described;
+    S.board.port = described.usbId;
+    S.board.usbLabel = described.label;
+    S.wizard.usbId = described.usbId;
+    setConnLabel(`${described.label} · ${described.usbId}`, false);
+
+    // 依 USB 身分先猜板子（低信心度，UI 上要標明）
+    const guess = guessBoardByUsb(described.vid, described.pid);
+    if (guess) {
+      S.wizard.boardId = guess.board.id;
+      S.wizard.confidence = guess.confidence;
+      applyFlashDefaults();
+    }
+
+    // 認晶片 —— 這一步會失敗，如果裝置在跑 MicroPython。**不要吞掉。**
+    $("#strip-activity").textContent = "偵測晶片…";
+    pushFlashLog(`序列埠 ${described.usbId}（${described.label}）`);
+    let chip = null;
+    try {
+      const transport = session.acquire({ trace: false });
+      const loader = new ESPLoader({
+        transport,
+        baudrate: 115200,
+        terminal: esptoolTerminal(),
+        debugLogging: false,
+      });
+      chip = await loader.main(S.wizard.resetMode || "default_reset");
+      S.board.chip = chip;
+      S.wizard.chip = chip;
+      pushFlashLog(`偵測到 ${chip}`);
+    } catch (error) {
+      // 連上了埠，但裝置不在 bootloader。這**不是失敗** —— 很正常。
+      S.board.chip = "（不在 bootloader）";
+      pushFlashLog(`無法進入 bootloader：${error?.message || error}`);
+      const diagnosis = await runDiagnosis({
+        title: "裝置有回應，但不在 bootloader",
+        detail: String(error?.message || error),
+      });
+      if (diagnosis?.verdict === "micropython-running") {
+        toast("warn", "裝置正在跑 MicroPython",
+          "連線成功，但燒錄需要先手動進 bootloader。詳情見側欄的診斷。", true);
+      }
+    } finally {
+      // 認完就放開 —— 燒錄時會重新取得。這樣其他程式才能用這個埠。
+      await session.release();
+      flashRuntime.session = null;
+      S.wizard.usbId = described.usbId;
+    }
+
+    S.connected = true;
+    S.board.baud = 115200;
+    S.board.name = chip ? `${chip}` : (guess?.board.label ?? described.label);
+    S.board.fw = chip ? "（bootloader 模式）" : "（未偵測固件）";
+    setConnLabel(`${described.label} · ${described.usbId}`, true);
+    $("#strip-activity").textContent = "";
+    renderStrip(`
+      <div class="ticket" data-active="true" title="${esc(described.label)}">
+        <span class="led" data-state="idle"></span>
+        <span class="name">${esc(chip || guess?.board.label || described.label)}</span>
+        <span class="meta">${esc(described.usbId)} · ${esc(described.label)}</span>
+      </div>
+      <button class="btn sm" data-act="disconnect">中斷</button>`);
+    setStatus("idle", "已連線");
+    $("#st-chip").textContent = chip
+      ? `${chip} · bootloader`
+      : `${described.label} · 不在 bootloader`;
+    renderSide(); renderCanvas(); renderTerm();
+    toast("ok", chip ? `已連線 ${chip}` : "已連線裝置",
+      chip ? "裝置在 bootloader，可以直接燒錄。" : "裝置不在 bootloader —— 要燒錄請按一下 BOOT 再按 RESET。",
+      !chip);
+  } catch (error) {
+    const explained = explainOpenFailure(error, "這個序列埠");
+    setStatus("error", "連線失敗");
+    S.failure = { title: explained.title, detail: explained.detail, advice: explained.actions };
+    $("#strip-activity").textContent = "";
+    renderStrip(`
+      <button class="empty-slot" data-act="connect">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        連線裝置</button>`, explained.title);
+    toast("err", explained.title, explained.actions?.[0] || explained.detail, true);
+    pushFlashLog(`連線失敗：${error?.message || error}`);
+    renderSide(); renderCanvas();
+  } finally {
+    setBusy(false);
+  }
 }
+
 function disconnect() {
+  releaseAllSessions().catch(() => {});
+  flashRuntime.session = null;
   S.connected = false;
-  $("#strip-slot").innerHTML = `
+  // 重設成與初始狀態**相同形狀**的物件（每個欄位都在，只是沒有值）。
+  // 用 null 而不是 "—"：讓「沒讀到」在所有地方的行為一致。
+  S.board = {
+    name: "尚未連線", chip: null, mac: null, features: null, crystalMHz: null,
+    flashId: null, usbLabel: null, port: null, baud: null, flash: null, fw: null,
+  };
+  S.wizard.chip = null;
+  S.wizard.failure = null;
+  renderStrip(`
     <button class="empty-slot" data-act="connect">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
-      連線裝置</button>
-    <span class="label" style="color:var(--bench-400)">尚未連線任何開發板</span>`;
+      連線裝置</button>`, "尚未連線任何開發板");
   setStatus("off", "未連線");
   $("#st-chip").textContent = "—"; $("#st-rate").textContent = "0 B/s";
   $("#st-fs").textContent = "檔案系統：未同步";
   $("#repl-state").innerHTML = "";
   renderSide(); renderCanvas(); renderTerm();
-  toast("warn", "已中斷連線", "裝置已釋放，可以重新連線。");
+  toast("warn", "已中斷連線", "序列埠已釋放，其他程式可以用了。");
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1299,12 +1832,43 @@ function disconnect() {
 /** 閒置的 session／loader，跨次燒錄保留（埠由 esptool 擁有，用完即放）。 */
 const flashRuntime = { session: null, loader: null, cancelRequested: false };
 
-/** 依目前選到的板子與埠，套用最不容易出錯的預設值。 */
+/**
+ * esptool 的輸出一行一行處理：寫進日誌，**同時撈出真實的裝置資訊**。
+ *
+ * ══ 為什麼要撈 ═════════════════════════════════════════════════════════
+ *
+ * esptool-js 把 MAC、Features、Flash ID 這些**印到 terminal**，不是回傳物件。
+ * 不撈的話裝置面板永遠是空的 —— 使用者就會覺得「全部都是假的」。
+ *
+ * 而且撈的好處是：**面板顯示的跟 log 顯示的是同一份資料。**
+ * 不會出現「log 說 MAC 是 58:e6:…、面板說 7c:df:…」這種最糟的情況。
+ *
+ * 撈不到就留白，**不要瞎猜**。
+ */
+function handleEsptoolOutput(line) {
+  pushFlashLog(line);
+  const facts = parseEsptoolLine(line);
+  if (facts && applyDeviceFacts(S.board, facts)) {
+    // 只有真的變了才重繪，避免每一行都觸發
+    renderSide();
+    if (S.view === "device") renderCanvas();
+  }
+}
+
+/**
+ * 依目前選到的板子與埠，套用最不容易出錯的預設值。
+ *
+ * 判斷用**精確的 USB-Serial-JTAG VID:PID**（303A:1001），不是籠統的「原生 USB」。
+ * 因為 esptool-js 內部的判斷就是那麼精確（`getVid()===0x303A && getPid()===0x1001`），
+ * 而且那個判斷會決定重置策略、並讓 `resetMode` 被忽略。
+ */
 function applyFlashDefaults() {
   const board = S.wizard.boardId ? findBoard(S.wizard.boardId) : null;
   if (!board) return;
-  const nativeUsb = flashRuntime.session?.described?.isNativeUsb ?? false;
-  const defaults = defaultFlashOptions(board, { usbSerialJtag: nativeUsb });
+  const described = flashRuntime.session?.described ?? null;
+  const usbJtag = described ? isUsbSerialJtag(described.vid, described.pid) : false;
+  S.wizard.isUsbJtag = usbJtag;
+  const defaults = defaultFlashOptions(board, { usbSerialJtag: usbJtag });
   S.wizard.baudrate = defaults.baudrate;
   S.wizard.eraseAll = defaults.eraseAll;
   S.wizard.resetMode = defaults.resetMode;
@@ -1335,12 +1899,18 @@ async function loadLocalFile(file) {
   renderCanvas();
 }
 
-/** 把 esptool 的輸出一行一行寫進日誌。**不要吞掉它** —— 那是唯一的診斷資訊。 */
+/**
+ * esptool 的 terminal 介面 —— 它所有輸出都經過這裡。
+ *
+ * **走 `handleEsptoolOutput`，不要直接 `pushFlashLog`。**
+ * 那個函式除了寫日誌，還會從輸出裡撈出 MAC / Features / Flash ID 填進裝置面板 ——
+ * 所以「log 顯示的」與「面板顯示的」是同一份資料，不可能對不起來。
+ */
 function esptoolTerminal() {
   return {
     clean: () => {},
-    writeLine: (line) => pushFlashLog(String(line)),
-    write: (chunk) => pushFlashLog(String(chunk).replace(/\n+$/, "")),
+    writeLine: (line) => handleEsptoolOutput(String(line)),
+    write: (chunk) => handleEsptoolOutput(String(chunk).replace(/\n+$/, "")),
   };
 }
 
@@ -1389,8 +1959,17 @@ async function flashStart() {
       flashRuntime.session = session;
       S.wizard.usbId = session.described.usbId;
       pushFlashLog(`序列埠 ${session.described.usbId}（${session.described.label}）`);
-      applyFlashDefaults();
     }
+
+    // **一定要在拿到埠之後重算一次預設值**，而且要在 if 外面。
+    //
+    // `resetMode` 取決於埠的真實 VID:PID（USB-Serial-JTAG 要用 `usb_reset`，
+    // 否則晶片不會進 bootloader）。步驟 2 顯示的那個值是「還沒選埠」時的猜測，
+    // 這裡才是真的會被用到的值。
+    //
+    // 放在 `if (!flashRuntime.session)` 裡面的話，如果 session 已經存在
+    // （例如使用者先按過「連線裝置」），就會跳過重算 —— 於是拿舊的猜測值去燒。
+    applyFlashDefaults();
 
     const session = flashRuntime.session;
     const transport = session.acquire({ trace: false });
@@ -1430,7 +2009,12 @@ async function flashStart() {
             w.progress = event.percent;
             w.rate = event.bytesPerSecond;
             w.eta = event.etaSeconds;
-            break;
+            // **一定要更新進度條。** 這個 case 原本只寫狀態、沒有重繪，
+            // 症狀是燒錄其實在跑、但使用者看到的永遠是 0%。
+            // 注意：這裡刻意**不呼叫 renderCanvas()** —— 那會讓整個 .wiz 重繪、
+            // 捲動位置跳掉、畫面閃爍。進度只碰進度相關的 DOM。
+            renderProgress();
+            return;
           case "log":
             pushFlashLog(`${event.level === "warn" ? "⚠ " : ""}${event.message}`);
             break;
@@ -1497,17 +2081,17 @@ async function flashStart() {
  */
 async function runDiagnosis(flashError) {
   const w = S.wizard;
-  const canDiagnose = /connect|timed out|no serial data/i.test(flashError?.detail || "");
+  const canDiagnose = /connect|timed out|no serial data|bootloader|Failed/i.test(flashError?.detail || "");
   if (!canDiagnose) {
     w.failure = flashError || w.failure;
-    return;
+    return null;
   }
 
-  pushFlashLog("── 開始診斷：為什麼連不上 ──");
+  pushFlashLog("── 開始診斷：裝置現在是什麼狀態 ──");
   const diagnosis = await diagnoseConnectionFailure({
     reopen: async () => {
-      const session = await acquirePort({ preferredUsbId: w.usbId });
-      if (!session) throw new Error("無法重新取得序列埠");
+      const session = await acquirePort({ preferredUsbId: w.usbId, reuseAuthorized: true });
+      if (!session) throw new Error("無法重新取得序列埠（使用者取消或埠被佔用）");
       return {
         port: session.port,
         release: async () => {
@@ -1542,8 +2126,16 @@ async function runDiagnosis(flashError) {
       advice: diagnosis.advice,
       diagnosis,
     };
+    S.board.fw = mp.version || S.board.fw;
+    S.board.chip = mp.variant || S.board.chip;
     pushFlashLog(`診斷結果：${w.failure.title}`);
-    toast("warn", "裝置已經有 MicroPython 了", "可能不需要燒錄。詳情見下方診斷。", true);
+  } else if (diagnosis.verdict === "silent") {
+    w.failure = {
+      title: flashError?.title || "裝置沒有回應",
+      detail: flashError?.detail || "",
+      advice: diagnosis.advice,
+      diagnosis,
+    };
   } else {
     w.failure = {
       title: flashError?.title || "燒錄失敗",
@@ -1553,6 +2145,7 @@ async function runDiagnosis(flashError) {
     };
   }
   renderCanvas();
+  return diagnosis;
 }
 
 function flashCancel() {
@@ -1563,18 +2156,39 @@ function flashCancel() {
 /* ══════════════════════════════════════════════════════════════════════
    命令面板
    ══════════════════════════════════════════════════════════════════════ */
+/**
+ * 命令面板的指令。
+ *
+ * ══ 只放**真的會做事**的指令 ═══════════════════════════════════════════
+ *
+ * 這裡原本還有「軟重置裝置」、「下載裝置快照」這些 —— 它們的實作是
+ * `toast("ok", "裝置已重置")` 這種**沒有任何動作的假成功訊息**。
+ * 使用者按了會以為裝置真的重置了。全部移除。
+ *
+ * 要加回來的條件：那個功能真的接了 raw REPL 或 esptool，而不是彈一個 toast。
+ * 還沒接上的功能，用 `notImplemented()` 誠實說明。
+ */
+function notImplemented(what, needs) {
+  toast("warn", `${what} 還沒接上`, needs, true);
+}
+
 const COMMANDS = [
-  { id: "connect",    t: "連線裝置",            h: "序列埠", ic: "⇄", run: connect },
-  { id: "disconnect", t: "中斷連線",            h: "",      ic: "⏻", run: disconnect },
+  { id: "connect",    t: "連線裝置",            h: "序列埠",  ic: "⇄", run: connect },
+  { id: "disconnect", t: "中斷連線",            h: "",       ic: "⏻", run: disconnect },
   { id: "flash",      t: "開啟燒錄精靈",        h: "Ctrl-2", ic: "⚡", run: () => go("flash") },
-  { id: "edit",       t: "回到編輯器",          h: "Ctrl-1", ic: "{}", run: () => go("edit") },
-  { id: "monitor",    t: "開啟序列埠監控",      h: "Ctrl-3", ic: "∿", run: () => go("monitor") },
-  { id: "packages",   t: "管理套件（mip）",     h: "Ctrl-4", ic: "▤", run: () => go("packages") },
+  { id: "edit",       t: "編輯器",              h: "Ctrl-1", ic: "{}", run: () => go("edit") },
+  { id: "monitor",    t: "序列埠監控",          h: "Ctrl-3", ic: "∿", run: () => go("monitor") },
+  { id: "packages",   t: "套件管理",            h: "Ctrl-4", ic: "▤", run: () => go("packages") },
   { id: "device",     t: "裝置資訊",            h: "Ctrl-5", ic: "▣", run: () => go("device") },
-  { id: "reset",      t: "軟重置裝置 (Ctrl-D)", h: "",      ic: "↻", run: () => { toast("ok", "裝置已重置"); } },
-  { id: "bootloader", t: "進入 bootloader",     h: "",      ic: "⏬", run: () => { toast("warn", "裝置已進入 bootloader", "現在可以燒錄固件。"); go("flash"); } },
-  { id: "snapshot",   t: "下載裝置快照",        h: "",      ic: "⬇", run: () => { toast("ok", "快照已下載", "device-snapshot-2026-02-14.zip · 4 個檔案"); } },
-  { id: "erase",      t: "抹除檔案系統…",       h: "危險", ic: "⚠", run: () => { toast("warn", "已取消", "抹除需要二次確認。", true); } },
+  { id: "release",    t: "釋放序列埠（卡住時用）", h: "",     ic: "⏏", run: async () => {
+      const n = await releaseAllSessions();
+      flashRuntime.session = null;
+      toast("ok", "已釋放序列埠", n ? `清理了 ${n} 個殘留連線。` : "沒有殘留連線。");
+    } },
+  { id: "help",       t: "目前哪些功能是真的？", h: "",      ic: "?",  run: () => {
+      toast("ok", "只有「燒錄」和「連線」是真的",
+        "編輯器 / REPL / 檔案總管 / 套件 / 監控都還是空的 —— 畫面上有標示。", true);
+    } },
 ];
 let cmdSel = 0, cmdHits = COMMANDS;
 function renderCmd(q = "") {
@@ -1668,7 +2282,7 @@ document.addEventListener("click", async (e) => {
     S.ptab = tab.dataset.ptab;
     $("#term").innerHTML = S.ptab === "repl"
       ? (S.connected ? "" : `<div class="dim">連線裝置後，這裡會出現 MicroPython 的 REPL。</div>`)
-      : `<div class="dim">裝置日誌（esptool / 協議層的原始輸出）</div><div class="out mono" style="font-size:11px">[12:04:31] serial: opened COM4 @921600<br>[12:04:31] probe: CTRL-C CTRL-A → raw REPL<br>[12:04:32] info: MicroPython v1.25.0 · ESP32-S3<br>[12:04:32] fs: 4 entries on /</div>`;
+      : `<div class="dim">裝置日誌（esptool 的原始輸出）會在燒錄時出現在「燒錄」頁的 log 區。</div>`;
     if (S.ptab === "repl" && S.connected) renderTerm();
     return;
   }
@@ -1678,32 +2292,32 @@ document.addEventListener("click", async (e) => {
   switch (act) {
     case "connect": connect(); break;
     case "disconnect": disconnect(); break;
-    case "refresh": toast("ok", "已重新整理", "讀到 4 個項目。"); break;
+
+    /* ── 沒有真功能的動作 ──────────────────────────────────────────────
+       這些原本會彈「已重新整理 · 讀到 4 個項目」、「已儲存到裝置」之類的假成功訊息，
+       甚至有一段用 setInterval 假裝上傳進度。**全部移除。**
+
+       假成功訊息比缺功能更糟：使用者會以為檔案真的上去了、裝置真的重置了，
+       然後在裝置上找不到東西，開始懷疑是自己操作錯。 */
+    case "refresh":
     case "upload":
-      uploading = { path: "/main.py", pct: 0 };
-      toast("ok", "開始上傳", "main.py → 裝置 /main.py（原子寫入）", true);
-      const up = setInterval(() => {
-        if (!uploading) return clearInterval(up);
-        uploading.pct += 8;
-        if (uploading.pct >= 100) { clearInterval(up); uploading = null; toast("ok", "上傳完成", "main.py · 89 B · 已驗證"); }
-        renderSide();
-      }, 120);
+    case "download-all":
+    case "goto-line":
+    case "run":
+    case "save":
+    case "interrupt":
+    case "soft-reset":
+    case "bootloader":
+    case "wipe":
+    case "factory":
+    case "snapshot":
+    case "pkg-install":
+    case "pkg-remove":
+    case "export-csv":
+      toast("warn", "這個功能還沒接上",
+        "它需要 Web Serial 版的 MicroPython raw REPL。目前只有「燒錄」是真的。", true);
       break;
-    case "download-all": toast("ok", "已下載 4 個檔案", "存到裝置快照資料夾。"); break;
-    case "goto-line": toast("ok", "已跳到第 2 行", "import json — 裝置上沒有這個模組。"); break;
-    case "run": termLine(`<span class="out">&gt;&gt;&gt; <span style="color:var(--bench-100)">exec(open('main.py').read())</span></span>`);
-      setTimeout(() => { termLine(`<span class="err">Traceback (most recent call last):</span>`);
-        termLine(`<span class="err">  File "&lt;stdin&gt;", line 2, in &lt;module&gt;</span>`);
-        termLine(`<span class="err">ImportError: no module named 'json'</span>`);
-        toast("err", "執行失敗：ImportError", "裝置上沒有 json 模組。錯誤已對到 main.py 第 2 行。", true); }, 500);
-      break;
-    case "save": toast("ok", "已儲存到裝置", "main.py · 原子寫入（.tmp → rename）"); break;
-    case "interrupt": termLine(`<span class="amber">KeyboardInterrupt</span>`); toast("warn", "已送出 Ctrl-C"); break;
-    case "soft-reset": toast("ok", "裝置已重置", "重新進入 REPL。"); renderTerm(); break;
-    case "bootloader": toast("warn", "裝置已進入 bootloader", "現在可以直接燒錄。"); go("flash"); break;
-    case "wipe": toast("warn", "抹除需要二次確認", "這個動作會刪掉裝置上全部檔案。", true); break;
-    case "factory": toast("warn", "恢復出廠固件", "會先抹除再寫入原廠 image。", true); break;
-    case "snapshot": toast("ok", "快照已下載", "device-snapshot.zip · 4 個檔案"); break;
+
     case "flash-start": flashStart(); break;
     case "flash-cancel": flashCancel(); break;
     case "flash-retry":
@@ -1726,15 +2340,7 @@ document.addEventListener("click", async (e) => {
       if (S.connected) { toast("ok", "已重新偵測", S.board.port || "序列埠"); }
       else { toast("warn", "請先按「連線裝置」", "Web Serial 需要使用者手動選擇序列埠。"); }
       break;
-    case "pkg-install": {
-      const row = e.target.closest("[data-pkg]");
-      const name = row.dataset.pkg;
-      e.target.outerHTML = `<span class="chip amber">安裝中…</span>`;
-      setTimeout(() => { toast("ok", `已安裝 ${name}`, "/lib · 來自 micropython.org/pi"); renderCanvas(); }, 1100);
-      break;
-    }
-    case "pkg-remove": toast("warn", "移除需要確認", "會刪除裝置 /lib 下的檔案。", true); break;
-    case "export-csv": toast("ok", "已匯出", "monitor-2026-02-14.csv · 1 284 筆"); break;
+    /* pkg-install / pkg-remove / export-csv 已經在上面歸到「尚未接上」那一組。 */
     case "clear-flash-log": S.wizard.logs = []; renderCanvas(); break;
     case "release-ports": {
       // 修 "The port is already open" 的自救按鈕。使用者不必重新整理頁面。
@@ -1806,67 +2412,29 @@ addEventListener("keydown", (e) => {
     const rect = wrap.getBoundingClientRect();
     const h = Math.min(Math.max(rect.bottom - e.clientY, 120), rect.height * .7);
     wrap.style.gridTemplateRows = `1fr 6px ${h}px`;
-    if (S.view === "monitor") drawChart();
+    // 監控頁目前沒有圖表引擎（亂數資料已移除），所以拖曳時不需要重繪圖表。
+    // 這裡原本是 `if (S.view === "monitor") drawChart();` —— 刪掉圖表引擎時
+    // 漏了這個呼叫點，變成 ReferenceError。
+    // 這個遺漏是 `tools/check-undefined.mjs` 抓到的。
   });
   grip.addEventListener("pointerup", (e) => { dragging = false; grip.releasePointerCapture(e.pointerId); document.body.style.cursor = ""; });
 })();
 
 /* ══════════════════════════════════════════════════════════════════════
-   監控圖表（原生 canvas，不用繪圖庫）
+   監控圖表
+   ──────────────────────────────────────────────────────────────────────
+   這裡原本有一整套用亂數產生資料的折線圖（`series`、`startChart`、
+   `drawChart`：溫度 24.6 °C、濕度 58.2 %、heap 184 KB，每 700 ms 跳一次）。
+   **已經移除。** 一張會動的圖看起來就像真的在讀資料，那是最容易騙到人的一種。
+
+   設計保存在 web/mock/index.html。要變成真的需要：
+     1. raw REPL 持續讀裝置吐出的 `print()` 輸出
+     2. 解析 `key=value` 或 CSV
+     3. canvas 繪圖（原型的作法是對的：不用繪圖庫，~60 行就夠）
    ══════════════════════════════════════════════════════════════════════ */
-const N = 120;
-const series = [
-  { key: "t", color: "#2fe0a8", data: [], min: 18, max: 32, v: 24.6 },
-  { key: "h", color: "#58c4dc", data: [], min: 30, max: 80, v: 58.2 },
-  { key: "m", color: "#f0a53c", data: [], min: 120, max: 220, v: 184 },
-];
-for (const s of series) for (let i = 0; i < N; i++) s.data.push(s.v + (Math.random() - .5) * (s.max - s.min) * .06);
-let chartTimer = null;
-function startChart() {
-  drawChart();
-  if (chartTimer) return;
-  chartTimer = setInterval(() => {
-    for (const s of series) {
-      const span = (s.max - s.min);
-      s.v = Math.min(s.max, Math.max(s.min, s.v + (Math.random() - .5) * span * .05));
-      s.data.push(s.v); s.data.shift();
-    }
-    $("#mv-t").textContent = series[0].v.toFixed(1) + " °C";
-    $("#mv-h").textContent = series[1].v.toFixed(1) + " %";
-    $("#mv-m").textContent = Math.round(series[2].v) + " KB";
-    $("#mv-n").textContent = (1284 + Math.floor(Date.now() / 2000) % 9999).toLocaleString();
-    drawChart();
-  }, 700);
-}
-function stopChart() { if (chartTimer) { clearInterval(chartTimer); chartTimer = null; } }
-function drawChart() {
-  const c = $("#chart"); if (!c) return;
-  const dpr = devicePixelRatio || 1;
-  const w = c.clientWidth, h = 240;
-  c.width = w * dpr; c.height = h * dpr;
-  const g = c.getContext("2d");
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  g.clearRect(0, 0, w, h);
-  g.strokeStyle = "rgba(38,43,52,.9)"; g.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = Math.round(8 + (h - 24) * i / 4) + .5;
-    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
-    g.fillStyle = "#6b7486"; g.font = "10px 'IBM Plex Mono', monospace";
-    g.fillText(String(100 - i * 25) + "%", 2, y - 3);
-  }
-  for (const s of series) {
-    g.strokeStyle = s.color; g.lineWidth = 1.6; g.beginPath();
-    s.data.forEach((v, i) => {
-      const x = (i / (N - 1)) * (w - 4) + 2;
-      const y = 8 + (h - 24) * (1 - (v - s.min) / (s.max - s.min));
-      i ? g.lineTo(x, y) : g.moveTo(x, y);
-    });
-    g.stroke();
-    const lv = s.data[N - 1];
-    const x = w - 2, y = 8 + (h - 24) * (1 - (lv - s.min) / (s.max - s.min));
-    g.fillStyle = s.color; g.beginPath(); g.arc(x, y, 2.6, 0, 7); g.fill();
-  }
-}
+
+/** 監控頁現在沒有圖可以畫，留這個空函式讓呼叫端不用到處判斷。 */
+function stopChart() {}
 
 /* ══════════════════════════════════════════════════════════════════════
    測試掛鉤
@@ -1882,12 +2450,43 @@ window.__MPT_TEST__ = {
 /* ══════════════════════════════════════════════════════════════════════
    啟動
    ══════════════════════════════════════════════════════════════════════ */
+
+// ── 啟動自我檢查 ────────────────────────────────────────────────────────
+// 在渲染之前先驗證「程式碼會用到的東西真的存在」。
+// 這兩類錯誤已經各咬過一次，而且症狀都是「按了沒反應、console 乾淨」。
+const SELF_CHECK = {
+  domIds: [
+    "app", "st-led", "st-conn", "st-chip", "st-rate", "st-fs", "st-hint",
+    // `conn-label` 曾經「有防護、沒元素」—— 每次連線都印一行錯誤卻沒有功能壞掉，
+    // 於是那行錯誤被當成雜訊忽略了好幾輪。放進清單，缺了就直接擋在啟動。
+    "conn-label",
+    "strip-slot", "strip-activity", "side-title", "side-body", "side-foot",
+    "canvas", "term", "repl-state", "toasts", "cmdk", "cmd-input", "cmd-list",
+  ],
+  stateKeys: [
+    "connected", "status", "view", "ptab", "busy", "caps", "board", "wizard",
+  ],
+};
+const problems = [
+  ...checkDom(SELF_CHECK.domIds).map((id) => `缺少 DOM id: ${id}`),
+  ...checkState(S, SELF_CHECK.stateKeys).map((key) => `狀態缺少欄位: S.${key}`),
+];
+window.__MPT_SELF_CHECK__ = { ...SELF_CHECK, problems };
+
 syncNav(); renderSide(); renderCanvas(); renderTerm();
-setTimeout(() => {
-  toast("ok", "mp_Tools 已就緒",
-    "燒錄是真的（esptool-js + Web Serial）。編輯器／REPL／檔案總管目前仍是設計稿畫面，還沒接上裝置。",
-    true);
-}, 400);
+
+// 探測本機服務（選配）。沒有跑是正常情況，不是錯誤。
+probeBackend();
+
+if (problems.length) {
+  toast("err", "啟動自我檢查失敗", `${problems.length} 個問題，詳見 console`, true);
+} else {
+  setTimeout(() => {
+    toast("ok", "mp_Tools 已就緒",
+      "燒錄與連線是真的（esptool-js + Web Serial）。編輯器／REPL／檔案總管仍是設計稿，畫面上有標示。",
+      true);
+  }, 400);
+}
 </script>
 </body>
 </html>

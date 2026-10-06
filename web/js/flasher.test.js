@@ -16,12 +16,13 @@ import assert from 'node:assert/strict';
 import {
   FlashError,
   ProgressAggregator,
+  afterMode,
   explainFlashFailure,
   formatBytes,
   formatRate,
   runFlash,
 } from './flasher.js';
-import { BOARDS, defaultFlashOptions, findBoard, guessBoardByUsb, micropythonUrl } from './catalog.js';
+import { BOARDS, defaultFlashOptions, findBoard, guessBoardByUsb, isUsbSerialJtag, micropythonUrl } from './catalog.js';
 
 /** 記錄呼叫順序的假 loader。 */
 function makeLoader(overrides = {}) {
@@ -242,14 +243,80 @@ test('ESP8266 預設要抹除，其他晶片不要', () => {
   assert.equal(defaultFlashOptions(findBoard('esp32s3-generic')).eraseAll, false);
 });
 
-test('原生 USB 的晶片要用 no_reset 與較保守的 baud rate', () => {
-  const options = defaultFlashOptions(findBoard('esp32s3-generic'), { usbSerialJtag: true });
-  assert.equal(options.resetMode, 'no_reset');
-  assert.equal(options.baudrate, 460800);
+test('★ resetMode 不能直接餵給 loader.after()（真實崩潰）', () => {
+  // ══ 這個 bug 燒了固件之後才爆，而且固件其實已經燒好了 ═══════════════════
+  //
+  // `after()` 只認得 hard_reset / soft_reset / no_reset_stub。其他值掉進 default：
+  //
+  //     default:
+  //       this.info("Staying in bootloader.");
+  //       this.IS_STUB && this.softReset(true);
+  //
+  // 而 `softReset(true)` 對非 ESP8266 會拋
+  // 「Soft resetting is currently only supported on ESP8266」。
+  //
+  // 我們對 USB-JTAG 晶片用 `usb_reset`（那是**進 bootloader** 的正確模式），
+  // 直接傳下去就中招。
+  assert.equal(afterMode('usb_reset', 'ESP32-S3'), 'hard_reset', 'usb_reset 不是 after() 的值');
+  assert.equal(afterMode('default_reset', 'ESP32-S3'), 'hard_reset');
+  assert.equal(afterMode('hard_reset', 'ESP32-S3'), 'hard_reset');
+});
 
+test('no_reset 在收尾時也要重置（因為 resetAfter 已經成立）', () => {
+  // `resetMode` 是「進去」用的，`after()` 是「出來」用的。既然走到 `after()`，
+  // 就代表使用者要「燒完之後重置」—— `no_reset_stub` 會把裝置留在 bootloader，
+  // 它不會開始跑新固件。真正不想重置的情況用 `resetAfter: false`。
+  assert.equal(afterMode('no_reset', 'ESP32-S3'), 'hard_reset');
+});
+
+test('soft_reset 只給 ESP8266（其他晶片會拋錯）', () => {
+  assert.equal(afterMode('soft_reset', 'ESP8266'), 'soft_reset');
+  // 就算有人硬傳 soft_reset，也不能讓它傳到 after() 去炸
+  assert.equal(afterMode('soft_reset', 'ESP32-S3'), 'hard_reset');
+  assert.equal(afterMode('soft_reset', 'ESP32-S3 (QFN56) (revision v0.2)'), 'hard_reset');
+  assert.equal(afterMode('soft_reset', null), 'hard_reset', '不知道晶片時選安全的');
+  assert.equal(afterMode('soft_reset'), 'hard_reset');
+});
+
+test('afterMode 的輸出永遠是 after() 認得的三個值之一', () => {
+  const valid = new Set(['hard_reset', 'soft_reset', 'no_reset_stub']);
+  const modes = ['default_reset', 'usb_reset', 'no_reset', 'hard_reset', 'soft_reset', '', null, undefined, 'garbage'];
+  const chips = ['ESP8266', 'ESP32', 'ESP32-S3', null];
+  for (const mode of modes) {
+    for (const chip of chips) {
+      const result = afterMode(mode, chip);
+      assert.ok(valid.has(result), `afterMode(${mode}, ${chip}) = ${result} 不是合法值`);
+    }
+  }
+});
+
+test('原生 USB 必須用 usb_reset，不是 no_reset', () => {
+  // ══ 這一條是實際踩過的坑，值的來源是 esptool-js 的 constructResetSequence ══
+  //
+  //     if (mode === "no_reset") return [];               ← 完全不重置
+  //     if (mode === "usb_reset" || isUsbJtagSerialPort())
+  //         return [usbJTAGSerialReset(transport)];       ← USB-JTAG 的正確路
+  //
+  // 原本這裡預設 `no_reset`（理由是「USB-Serial-JTAG 沒有 DTR/RTS」），
+  // 那個理由錯了 —— 那個模式會回傳**空的重置序列**，晶片永遠不會進 bootloader，
+  // 症狀是 `Failed to connect with the device`，而且看起來像硬體問題。
+  const options = defaultFlashOptions(findBoard('esp32s3-generic'), { usbSerialJtag: true });
+  assert.equal(options.resetMode, 'usb_reset', 'no_reset 會回傳空序列，等於不重置');
+  assert.equal(options.baudrate, 460800, 'USB-JTAG 在高 baud 下較容易出錯，先求穩');
+
+  // 橋接晶片（CP210x / CH34x）走 classic reset
   const bridge = defaultFlashOptions(findBoard('esp32s3-generic'), { usbSerialJtag: false });
   assert.equal(bridge.resetMode, 'default_reset');
   assert.equal(bridge.baudrate, 921600);
+});
+
+test('認得出 USB-Serial-JTAG 的 VID:PID', () => {
+  // esptool-js 內部用 `getVid() === 0x303A && getPid() === 0x1001` 判斷，
+  // 是的話 resetMode 會被忽略、一律走 usbJTAGSerialReset。
+  assert.equal(isUsbSerialJtag(0x303a, 0x1001), true, 'ESP32-S2/S3/C3/C6/H2 的原生 USB');
+  assert.equal(isUsbSerialJtag(0x303a, 0x4001), false, '不同 PID 不是 USB-JTAG');
+  assert.equal(isUsbSerialJtag(0x10c4, 0xea60), false, 'CP210x 是橋接晶片');
+  assert.equal(isUsbSerialJtag(null, null), false, '未知裝置不該被當成 USB-JTAG');
 });
 
 test('橋接晶片的 VID:PID 只能給低信心度的猜測', () => {

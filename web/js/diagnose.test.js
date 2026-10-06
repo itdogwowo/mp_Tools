@@ -83,17 +83,29 @@ test('沒有 SPIRAM 的板子回 null（不要亂加變體）', () => {
 
 // ── 指示文字 ───────────────────────────────────────────────────────────
 
-test('USB-Serial-JTAG 的指示必須提到「沒有自動重置電路」與 BOOT 鍵', () => {
-  const advice = buildBootloaderAdvice();
-  const text = advice.join('\n');
-  assert.match(text, /BOOT/, '一定要提到 BOOT 鍵');
-  assert.match(text, /RESET/, '一定要提到 RESET 鍵');
-  assert.match(text, /沒有自動重置電路/, '要解釋為什麼 esptool 自己做不到');
+test('USB-JTAG 的指示要指向 reset mode，而不是斷言硬體做不到', () => {
+  // ══ 這一條原本守的是錯的規格 ═════════════════════════════════════════
+  //
+  // 第一版寫的是「沒有自動重置電路，一定要手動按 BOOT」。**那是錯的。**
+  // 讀 esptool-js 的 constructResetSequence() 之後發現它有專門的
+  // UsbJtagSerialReset 策略，只要 VID:PID 是 303A:1001 就會自動使用。
+  //
+  // 真正的問題是我們自己送了 `no_reset`（回傳空序列）。
+  // 所以指示應該指向 reset mode，手動按 BOOT 是**備案**。
+  const text = buildBootloaderAdvice(null, { usbJtag: true }).join('\n');
+  assert.match(text, /UsbJtagSerialReset|USB-Serial-JTAG/, '要說明正確的機制');
+  assert.match(text, /no_reset/, '要指出真正的兇手是 no_reset');
+  assert.match(text, /usb_reset/, '要給出正確的值');
+  assert.match(text, /備案/, '手動進 bootloader 應該是備案而不是唯一的路');
+  assert.ok(!/沒有自動重置電路/.test(text), '不該再斷言硬體做不到（那是錯的）');
 });
 
-test('沒有 RESET 鍵的板子要有替代做法（拔插 USB）', () => {
+test('手動進 bootloader 的步驟仍然要清楚（備案用）', () => {
   const text = buildBootloaderAdvice().join('\n');
+  assert.match(text, /BOOT/, '一定要提到 BOOT 鍵');
+  assert.match(text, /RESET/, '一定要提到 RESET 鍵');
   assert.match(text, /拔掉再插上|拔掉再插/, '沒有 RESET 鍵的板子需要替代方案');
+  assert.match(text, /可能換一個名字|換一個名字/, '要提醒埠號會變 —— 實測 COM27 → COM26');
 });
 
 test('偵測到 Octal-SPIRAM 時要提醒選對變體', () => {

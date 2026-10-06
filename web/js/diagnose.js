@@ -196,23 +196,52 @@ export async function diagnoseConnectionFailure({ reopen, onEvent = () => {} }) 
 /**
  * 依晶片類型給出「怎麼進 bootloader」的指示。
  *
- * 這是整份程式碼裡最需要寫對的文字。USB-Serial-JTAG 與橋接晶片的方式**完全不同**，
- * 給錯指示會讓使用者按半天沒反應。
+ * ══ 這段文字修正過一次，原因值得記錄 ═════════════════════════════════
+ *
+ * 第一版寫的是「USB-Serial-JTAG **沒有自動重置電路**，esptool 無法用 DTR/RTS
+ * 把它踢進 bootloader，**一定要手動**」。**那是錯的。**
+ *
+ * 讀 esptool-js 的 `constructResetSequence()` 之後才發現它有一個專門的
+ * `UsbJtagSerialReset` 策略，而且只要 VID:PID 是 303A:1001 就會自動使用：
+ *
+ *     if (mode === "usb_reset" || isUsbJtagSerialPort())
+ *         return [usbJTAGSerialReset(transport)];
+ *
+ * 真正的問題是**我們自己送了 `no_reset`**，而那個模式回傳空的重置序列。
+ * 所以正確的指示是「先確認 reset mode 是 usb_reset」，手動進 bootloader 是**備案**。
+ *
+ * 教訓：說「硬體做不到」之前，先讀官方實作。
  */
-export function buildBootloaderAdvice(firmwareVariant = null) {
-  const advice = [
-    '**這顆晶片是原生 USB（USB-Serial-JTAG），沒有自動重置電路** —— ' +
-      'esptool 無法用 DTR/RTS 把它踢進 bootloader，一定要手動。',
-    '手動進 bootloader：按住板子上的 **BOOT** 鍵不放 → 按一下 **RESET** → 放開 RESET → 再放開 BOOT',
-    '沒有 RESET 鍵的板子：按住 **BOOT** 不放，把 USB 拔掉再插上，然後放開 BOOT',
-    '進去之後螢幕上的埠可能會換一個名字（例如從 COM27 變成另一個 COM），要重新選',
-  ];
+export function buildBootloaderAdvice(firmwareVariant = null, context = {}) {
+  const advice = [];
+
+  // 如果我們知道這個埠是 USB-JTAG，就說明正確的機制
+  if (context.usbJtag) {
+    advice.push(
+      '這個埠是 **USB-Serial-JTAG（原生 USB）**。esptool-js 有專門的重置策略 ' +
+        '`UsbJtagSerialReset` 會自動處理 —— 前提是 reset mode **不能是 `no_reset`**（那會跳過重置）。',
+    );
+    advice.push(
+      '請確認 reset mode 是 `usb_reset` 或 `default_reset`，然後再試一次。' +
+        '這兩者在 USB-JTAG 上都會走同一條正確的路。',
+    );
+  }
+
+  // 手動進 bootloader 是**備案**，不是唯一的路
+  advice.push(
+    '如果重試還是不行，手動進 bootloader（這是備案，不是必要步驟）：' +
+      '按住 **BOOT** → 按一下 **RESET** → 放開 RESET → 再放開 BOOT',
+  );
+  advice.push('沒有 RESET 鍵的板子：按住 **BOOT** 不放，把 USB 拔掉再插上，然後放開 BOOT');
+  advice.push('進去之後埠可能會換一個名字（例如 COM27 → COM26），要重新選');
+
   if (firmwareVariant === 'SPIRAM_OCT') {
     advice.push(
       '⚠ 這塊板子是 **Octal-SPIRAM** 版本。要重燒的話請選 `SPIRAM_OCT` 變體的固件，' +
         '燒標準版會認不到完整的 RAM。',
     );
   }
-  advice.push('如果你只是想寫程式，**根本不需要燒錄** —— 裝置已經在跑 MicroPython 了');
+
+  advice.push('如果你只是想寫程式，**可能根本不需要燒錄** —— 裝置已經在跑 MicroPython 了');
   return advice;
 }

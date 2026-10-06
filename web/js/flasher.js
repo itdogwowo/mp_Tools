@@ -49,6 +49,57 @@ export class FlashError extends Error {
 }
 
 /**
+ * `resetMode` → `loader.after()` 的模式。**這兩個不是同一個東西。**
+ *
+ * ══ 一個真實的崩潰，以及為什麼 ═════════════════════════════════════════
+ *
+ * `resetMode` 有四個可能值：`default_reset` / `usb_reset` / `no_reset` / `hard_reset`。
+ * 它決定 esptool **用什麼重置序列讓晶片進入 bootloader**。
+ *
+ * `loader.after()` 只認得**三個**值，而且語意不同 —— 它決定燒完之後**怎麼離開**：
+ *
+ *     case "hard_reset":    HardReset（全部晶片都支援）
+ *     case "soft_reset":    softReset(false)
+ *     case "no_reset_stub": 留在 stub
+ *     default:
+ *       this.info("Staying in bootloader.");
+ *       this.IS_STUB && this.softReset(true);   // ← 陷阱在這裡
+ *
+ * 所以把 `usb_reset` 直接餵給 `after()` 會掉進 `default`，
+ * 而 `softReset(true)` 對非 ESP8266 的晶片會拋：
+ *
+ *     Soft resetting is currently only supported on ESP8266
+ *
+ * 而且那是一個 **unhandled rejection** —— 固件其實已經燒好了，但使用者看到紅色錯誤，
+ * 合理懷疑是燒錄失敗。
+ *
+ * ══ 對應方式 ═══════════════════════════════════════════════════════════
+ *
+ *   `hard_reset`                     → `hard_reset`（本來就是對的）
+ *   `soft_reset`（只有 ESP8266 能用） → `soft_reset`
+ *   `no_reset`                       → `hard_reset`
+ *   **其他（含 `usb_reset`、`default_reset`）→ `hard_reset`**
+ *
+ * 為什麼 `no_reset` 也對應到 `hard_reset`：`resetMode` 是「**進去**的時候」用的，
+ * 而這支函式只在「**出來**的時候」被呼叫，而且已經在 `if (resetAfter)` 裡面。
+ * 既然使用者要「燒完之後重置」，那 `no_reset_stub`（留在 bootloader）就違背原意 ——
+ * 裝置不會開始跑新固件。真正想「不要重置」的情況，呼叫端會傳 `resetAfter: false`
+ * 而根本不會走到這裡。
+ *
+ * `usb_reset` 已經在「進入 bootloader」那一步發揮作用了（走 `UsbJtagSerialReset`）。
+ * 燒完之後要的是**重新啟動跑新固件**，那對所有晶片都是 `hard_reset`。
+ *
+ * @param {string} resetMode 用來進 bootloader 的模式
+ * @param {string|null} chip 晶片名（`soft_reset` 只有 ESP8266 支援）
+ */
+export function afterMode(resetMode, chip = null) {
+  if (resetMode === 'soft_reset' && String(chip ?? '').toUpperCase().includes('ESP8266')) {
+    return 'soft_reset';
+  }
+  return 'hard_reset';
+}
+
+/**
  * 把 esptool 的原始錯誤翻成可行動的建議。
  * esptool 的錯誤訊息對熟悉的人很清楚，對第一次用的人完全沒用。
  */
@@ -278,7 +329,7 @@ export async function runFlash(options) {
       emit({ type: 'phase', phase: 'resetting' });
       emit({ type: 'log', level: 'info', message: '重置裝置…' });
       try {
-        await loader.after(resetMode === 'no_reset' ? 'hard_reset' : resetMode);
+        await loader.after(afterMode(resetMode, chipName));
       } catch (error) {
         // 重置失敗不算燒錄失敗 —— 固件已經寫進去了，使用者手動按 RESET 就好
         emit({

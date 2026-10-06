@@ -30,7 +30,9 @@ import { Transport } from '../vendor/esptool-js.bundle.js';
 
 const KNOWN_USB = [
   { vid: 0x303a, pid: 0x4001, label: 'Espressif USB-Serial-JTAG（ESP32-S3 原生 USB）' },
-  { vid: 0x303a, pid: 0x1001, label: 'Espressif USB-Serial-JTAG（ESP32-S2/C3/C6 原生 USB）' },
+  // 0x1001 是 Espressif 原生 USB-Serial-JTAG 的通用 PID，涵蓋整條產品線 ——
+  // 所以標籤要列出所有型號，不要只寫其中幾個（S3 也在裡面）。
+  { vid: 0x303a, pid: 0x1001, label: 'Espressif USB-Serial-JTAG（ESP32-S2/S3/C3/C6/H2 原生 USB）' },
   { vid: 0x10c4, pid: 0xea60, label: 'Silicon Labs CP2102/CP2104' },
   { vid: 0x10c4, pid: 0xea70, label: 'Silicon Labs CP2105' },
   { vid: 0x1a86, pid: 0x7523, label: 'WCH CH340' },
@@ -105,6 +107,33 @@ export async function getAuthorizedPorts() {
     console.warn('[serial] getPorts 失敗', error);
     return [];
   }
+}
+
+/**
+ * 記住「使用者選過哪個埠」。
+ *
+ * ══ 這一段是照 Adafruit 的做法寫的 ═══════════════════════════════════
+ *
+ * 他們的 `clickConnect()` 是：
+ *
+ *     if (device === null) { device = await serialLib.requestPort({}); }
+ *
+ * 也就是**埠只 request 一次，之後重複使用同一個 SerialPort 物件**。
+ * 好處很實際：`requestPort()` 每次都會跳一次系統對話框，而使用者選的
+ * 幾乎每次都是同一塊板子。重複問只是騷擾。
+ *
+ * 我們的作法：先用 `navigator.serial.getPorts()`（**不需要手勢**）拿已授權的埠；
+ * 沒有才跳對話框。這是同一個精神，但更好 —— 重新整理頁面之後也能自動接回來。
+ */
+let rememberedPort = null;
+
+/** 使用者選過的埠（還在授權清單裡的話）。 */
+export function rememberedPortInfo() {
+  return rememberedPort ? describePort(rememberedPort) : null;
+}
+
+export function forgetPort() {
+  rememberedPort = null;
 }
 
 export class SerialAccessError extends Error {
@@ -225,6 +254,35 @@ export function trackedPortCount() {
 }
 
 /**
+ * 這個錯誤是不是「埠本來就已經關了」？
+ *
+ * ══ 為什麼要特別判斷 ═══════════════════════════════════════════════════
+ *
+ * USB-Serial-JTAG 的重置序列會讓裝置**重新列舉** —— 埠在那一刻就自動關閉了。
+ * 我們之後再呼叫 `close()` 就會撞：
+ *
+ *     InvalidStateError: Failed to execute 'close' on 'SerialPort':
+ *     The port is already closed.
+ *
+ * 那個訊息看起來像嚴重錯誤，實際上**我們要的狀態已經達成了**（埠是關的）。
+ * 把它當警告印出來只會侵蝕信任 —— 使用者會開始忽略 console，
+ * 然後真正的錯誤也跟著被忽略（這個專案已經因為「雜訊麻痺」吃過好幾次虧）。
+ *
+ * Web Serial 對這個情況用的是 `InvalidStateError`；有些實作會用
+ * `NotFoundError`（裝置已拔除）。兩者都算「已經是關的」。
+ */
+function isAlreadyClosed(error) {
+  if (!error) return false;
+  const name = error.name || '';
+  const message = String(error.message || error);
+  return (
+    name === 'InvalidStateError' ||
+    name === 'NotFoundError' ||
+    /already closed|not open|device was disconnected|device has been lost/i.test(message)
+  );
+}
+
+/**
  * 一個燒錄工作階段 —— **由 esptool-js 完全擁有序列埠**。
  *
  * 生命週期：
@@ -269,28 +327,57 @@ export class FlashSession {
   /**
    * 收尾。**必須呼叫。**
    *
-   * `Transport.disconnect()` 做三件事：取消 reader、等 unlock、`device.close()`。
-   * 我們**不要**自己再呼叫一次 `port.close()` —— 重複關閉會丟錯，而且會蓋掉
-   * 真正的錯誤原因。
+   * ══ 順序是照 Adafruit 的做法（他們的 clickConnect 斷線那一段）════════
+   *
+   *     await transport.disconnect();
+   *     await transport.waitForUnlock(1500);
+   *     if (device !== null) { await device.close(); device = null; }
+   *
+   * 三個步驟各有理由：
+   *   1. `disconnect()` 取消 reader 並關掉埠
+   *   2. `waitForUnlock()` 等鎖真的放掉 —— 不等就重開會撞 `InvalidStateError`
+   *   3. `port.close()` 是**保險**：如果 disconnect 半途失敗（例如埠已經被拔掉），
+   *      這一步確保埠回到關閉狀態。
+   *
+   * **「已經關了」不算失敗。** 每一步都用 `isAlreadyClosed()` 判斷 ——
+   * 我們要的結果是「埠是關的」，而它本來就是關的，那就成功了。
+   * 這種情況在 USB-Serial-JTAG 上**每次都會發生**（重置會讓裝置重新列舉），
+   * 當成警告印出來只會製造雜訊。
+   *
+   * **`this.port` 不會被丟掉。** 埠物件是可以重複使用的，留著它下次就不用再跳
+   * 一次對話框（見 `rememberedPort`）。
    */
   async release() {
     if (this.released) return;
     this.released = true;
     const transport = this.transport;
     this.transport = null;
-    if (!transport) {
-      OPEN_PORTS.delete(this.port);
-      return;
+
+    if (transport) {
+      try {
+        await transport.disconnect();
+      } catch (error) {
+        // 「已經關了」是預期情況，不是問題 —— 尤其在 USB-JTAG 上
+        if (!isAlreadyClosed(error)) {
+          console.warn('[serial] transport.disconnect 失敗（仍會繼續收尾）', error);
+        }
+      }
+      try {
+        await transport.waitForUnlock?.(1500);
+      } catch (error) {
+        if (!isAlreadyClosed(error)) {
+          console.warn('[serial] waitForUnlock 逾時', error);
+        }
+      }
     }
+
+    // 保險：不論上面成不成功，都確保埠是關的
     try {
-      await transport.disconnect();
+      if (this.port.readable || this.port.writable) await this.port.close();
     } catch (error) {
-      console.warn('[serial] transport.disconnect 失敗（仍會解除登記）', error);
-    }
-    try {
-      await transport.waitForUnlock?.(1500);
-    } catch (error) {
-      console.warn('[serial] waitForUnlock 逾時', error);
+      if (!isAlreadyClosed(error)) {
+        console.warn('[serial] port.close 失敗', error);
+      }
     }
     OPEN_PORTS.delete(this.port);
   }
@@ -307,13 +394,17 @@ export async function releaseAllSessions() {
     try {
       await entry.transport?.disconnect?.();
     } catch (error) {
-      console.warn('[serial] 緊急清理失敗', error);
+      if (!isAlreadyClosed(error)) {
+        console.warn('[serial] 緊急清理失敗', error);
+      }
     }
     // disconnect() 應該已經關掉了；這裡只是最後一道保險
     try {
       if (port.readable || port.writable) await port.close();
-    } catch {
-      /* 已經關了就忽略 */
+    } catch (error) {
+      if (!isAlreadyClosed(error)) {
+        console.warn('[serial] 緊急清理時關埠失敗', error);
+      }
     }
   }
   return entries.length;
@@ -327,27 +418,41 @@ if (typeof window !== 'undefined') {
 }
 
 /**
- * 便利函式：取得一個可以燒錄的埠（必要時跳對話框）。
- * 回傳的是 **尚未開啟** 的 FlashSession。
+ * 便利函式：取得一個可以燒錄的埠。回傳 **尚未開啟** 的 FlashSession。
  *
- * 會先嘗試「已授權的埠」—— 那不需要使用者手勢，所以「重試」可以是純按鈕操作。
+ * 挑埠的順序（照 Adafruit 的精神：**盡量不要重複問使用者**）：
+ *
+ *   1. 之前選過的埠（`rememberedPort`）—— 如果它還在授權清單裡
+ *   2. `navigator.serial.getPorts()` 裡唯一的那個 —— **不需要手勢**
+ *   3. 跳 `requestPort()` 對話框 —— 只有前兩者都拿不到時才問
+ *
+ * 第 2 步很重要：**重新整理頁面之後也能自動接回來**，因為授權是持久的。
+ * 使用者只被問過一次。
  */
 export async function acquirePort(options = {}) {
   await releaseAllSessions(); // 先把上一次的收乾淨，避免 already open
 
-  let described = null;
   const authorized = await getAuthorizedPorts();
-  if (options.reuseAuthorized !== false) {
+  let described = null;
+
+  // 1. 先用記住的埠
+  if (rememberedPort && authorized.some((entry) => entry.port === rememberedPort)) {
+    described = describePort(rememberedPort);
+  }
+  // 2. 已授權清單裡唯一的 / 符合偏好的那一個
+  if (!described && options.reuseAuthorized !== false) {
     if (authorized.length === 1) described = authorized[0];
     else if (authorized.length > 1 && options.preferredUsbId) {
       described = authorized.find((entry) => entry.usbId === options.preferredUsbId) ?? null;
     }
   }
+  // 3. 真的沒有才跳對話框（**必須在使用者手勢中**）
   if (!described) {
     described = await requestPort({ filters: options.filters });
   }
   if (!described) return null; // 使用者取消
 
+  rememberedPort = described.port;
   const session = new FlashSession(described);
   session.acquire({ trace: options.trace });
   return session;

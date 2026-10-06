@@ -42,7 +42,18 @@ __all__ = ["create_app", "serve"]
 
 log = logging.getLogger("mptools.web")
 
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+# ══ 只有一個 UI ══════════════════════════════════════════════════════════
+#
+# 這裡原本有自己的 UI 副本（`mptools/web/index.html` + `bridge.js`）。
+# 那是**錯的**：兩份 UI 會漂移，而漂移的時候沒有任何東西會報錯。
+#
+# 實際發生的後果：使用者開的是 Python 服務（`http://127.0.0.1:8765`），
+# 看到的是那份過時副本裡的模擬連線與示範資料；而我們一直在修另一份
+# （`web/index.html`）。**改了幾個小時，使用者看到的東西完全沒變。**
+#
+# 所以：Python 服務直接服務 `web/` 那份唯一的 UI。
+# 靜態託管（start-web.cmd）與本機服務看到的是**同一個檔案**。
+WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 
 
 # ── 連線狀態 ────────────────────────────────────────────────────────────
@@ -295,11 +306,16 @@ async def _handle_ws_message(session: DeviceSession, payload: dict[str, Any]) ->
 
 
 async def handle_index(request: web.Request) -> web.Response:
-    """送出 UI，並注入 bridge script。
+    """送出 UI。
 
-    注入而不是改動 ``index.html`` 是刻意的：那份 HTML 是**已定案的設計稿**，
-    我們不想讓它和後端實作糾纏在一起。bridge 只負責把假資料換成真的，
-    拿掉 bridge 之後 UI 仍然是一個可以獨立開啟的設計原型。
+    ══ 這裡原本會注入 bridge.js —— 已經不需要了 ══════════════════════════
+    `web/index.html` 現在自己就會：
+      · 用 `navigator.serial` 取得序列埠（不需要後端）
+      · 探測 `/api/health`，有本機服務就顯示埠號／序號／USB 位置（見 `portPanel()`）
+      · 有服務時才呼叫 `/api/ports`
+
+    所以不需要再注入任何東西 —— **服務的就是同一個檔案**，
+    靜態託管與本機服務看到完全一樣的 UI。少一層注入就少一個會漂移的地方。
     """
     index = WEB_DIR / "index.html"
     if not index.is_file():
@@ -307,18 +323,12 @@ async def handle_index(request: web.Request) -> web.Response:
             status=500,
             text=(
                 f"找不到 UI：{index}\n"
-                "請確認 mptools/web/index.html 存在。"
+                f"（WEB_DIR 解析為 {WEB_DIR}）\n"
+                "請確認 repo 裡的 web/index.html 存在。"
             ),
             content_type="text/plain",
         )
-    html = index.read_text(encoding="utf-8")
-    tag = '<script src="/static/bridge.js" defer></script>'
-    if tag not in html:
-        if "</body>" in html:
-            html = html.replace("</body>", f"  {tag}\n</body>", 1)
-        else:
-            html += tag
-    return web.Response(text=html, content_type="text/html", charset="utf-8")
+    return web.FileResponse(index)
 
 
 def create_app() -> web.Application:
@@ -333,7 +343,20 @@ def create_app() -> web.Application:
     app.router.add_post("/api/exec", handle_exec)
     app.router.add_get("/api/device", handle_device)
     app.router.add_get("/ws", handle_ws)
+
+    # ══ 靜態檔案的路由要對上 UI 實際用的路徑 ══════════════════════════════
+    #
+    # `web/index.html` 用相對路徑載入資源：`./js/serial.js`、`./vendor/…`。
+    # 所以服務就必須在**同樣的路徑**提供它們。
+    #
+    # 這裡原本只註冊了 `/static/` —— 結果 `/js/*` 與 `/vendor/*` 全部 404，
+    # 整個 module graph 載入失敗，**畫面一片空白、console 只有 404**。
+    # （檔案都在，只是路徑對不上。）
     if WEB_DIR.is_dir():
+        for sub in ("js", "vendor"):
+            if (WEB_DIR / sub).is_dir():
+                app.router.add_static(f"/{sub}/", WEB_DIR / sub, show_index=False)
+        # 保留 /static/ 作為整包的入口（除錯用；UI 本身不需要）
         app.router.add_static("/static/", WEB_DIR, show_index=False)
     return app
 

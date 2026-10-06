@@ -25,8 +25,10 @@ mpt = "mptools.cli:main"
 [tool.setuptools.packages.find]
 include = ["mptools*"]
 
-[tool.setuptools.package-data]
-mptools = ["web/*", "web/**/*"]
+# 注意：`web/` **不是**這個 Python 套件的一部分 —— 它是獨立的靜態 UI。
+# `mptools/web/server.py` 用相對路徑找到它（repo 根目錄的 `web/`）。
+# 所以這裡不需要 package-data；裝成 wheel 時要另外把 `web/` 一起帶上，
+# 但那個情況下 server.py 的路徑解析也要跟著改。目前以「從 repo 執行」為主。
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
