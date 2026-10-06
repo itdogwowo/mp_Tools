@@ -218,3 +218,41 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── mp_Tools ────────────────────────────────────────────────────────────
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+# pytest 在 Windows 上清不掉的暫存目錄（sandbox 會鎖住）
+pytest-cache-files-*/
+
+# 臨時探測腳本與截圖（截圖會連 IDE 側邊欄的專案名稱一起拍進去）
+_probe_*.py
+_*-verify.png
+prototype/_shot-*.png
+
+# Node / 前端（日後若做 Web 版會用到）
+node_modules/
+.pnpm-store/
+.npm-cache/
+dist-ssr/
+*.tsbuildinfo
+coverage/
+.vite/
+
+# Tauri
+apps/desktop/src-tauri/target/
+**/src-tauri/gen/
+
+# 固件快取（很大，且可重新下載）
+.firmware-cache/
+
+# 編輯器 / 系統
+.DS_Store
+Thumbs.db
